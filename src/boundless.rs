@@ -1000,7 +1000,7 @@ impl BoundlessProver {
         &self,
         request_id: &str,
         input: Vec<u8>,
-        elf: &[u8],
+        _elf: &[u8],
         image_url: Url,
         offer_params: BoundlessOfferParams,
         proof_type: ProofType,
@@ -1022,9 +1022,9 @@ impl BoundlessProver {
         })?;
 
         // Evaluate cost
-        let (mcycles_count, _) = self.evaluate_cost(&guest_env, elf).await
-            .map_err(|e| AgentError::GuestExecutionError(format!("Failed to evaluate cost: {}", e)))?;
-        // let mcycles_count = 2000;
+        // let (mcycles_count, _) = self.evaluate_cost(&guest_env, elf).await
+        //     .map_err(|e| AgentError::GuestExecutionError(format!("Failed to evaluate cost: {}", e)))?;
+        let mcycles_count = 4000;
 
         // Upload input to storage so provers fetch from a URL (preferred over inline)
         tracing::info!(
