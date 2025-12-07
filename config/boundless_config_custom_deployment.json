@@ -20,7 +20,7 @@
             "timeout_ms_per_mcycle": 3000,
             "max_price_per_mcycle": "0.00000001",
             "min_price_per_mcycle": "0.000000001",
-            "lock_collateral": "3"
+            "lock_collateral": "5"
         }
     },
     "rpc_url": "https://ethereum-sepolia-rpc.publicnode.com"

@@ -22,7 +22,9 @@ use risc0_zkvm::{Digest, Receipt as ZkvmReceipt, default_executor};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use utoipa::ToSchema;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -385,6 +387,12 @@ pub struct BoundlessProver {
     active_requests: Arc<RwLock<HashMap<String, AsyncProofRequest>>>,
     storage: BoundlessStorage,
     image_manager: ImageManager,
+}
+
+static TTL_CLEANUP_HANDLE: OnceLock<tokio::sync::Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
+
+fn ttl_cleanup_handle() -> &'static tokio::sync::Mutex<Option<JoinHandle<()>>> {
+    TTL_CLEANUP_HANDLE.get_or_init(|| tokio::sync::Mutex::new(None))
 }
 
 // More specific error types
@@ -753,7 +761,7 @@ impl BoundlessProver {
         }
 
         // Start background TTL cleanup task
-        Self::start_ttl_cleanup_task(prover.storage.clone(), prover.active_requests.clone());
+        Self::start_ttl_cleanup_task(prover.storage.clone(), prover.active_requests.clone()).await;
 
         Ok(prover)
     }
@@ -838,6 +846,8 @@ impl BoundlessProver {
         status: ProofRequestStatus,
         active_requests: &Arc<RwLock<HashMap<String, AsyncProofRequest>>>,
     ) -> AgentResult<()> {
+        let is_terminal = matches!(status, ProofRequestStatus::Fulfilled { .. } | ProofRequestStatus::Failed { .. });
+
         // Update status in memory
         {
             let mut requests_guard = active_requests.write().await;
@@ -870,6 +880,12 @@ impl BoundlessProver {
                 "Storage update failed: {}",
                 e
             )));
+        }
+
+        // Drop terminal entries from memory to avoid unbounded growth
+        if is_terminal {
+            let mut requests_guard = active_requests.write().await;
+            requests_guard.remove(request_id);
         }
 
         Ok(())
@@ -1024,7 +1040,7 @@ impl BoundlessProver {
         // Evaluate cost
         // let (mcycles_count, _) = self.evaluate_cost(&guest_env, elf).await
         //     .map_err(|e| AgentError::GuestExecutionError(format!("Failed to evaluate cost: {}", e)))?;
-        let mcycles_count = 2000;
+        let mcycles_count = 4000;
 
         // Upload input to storage so provers fetch from a URL (preferred over inline)
         tracing::info!(
@@ -1366,9 +1382,18 @@ impl BoundlessProver {
         // Try to get from SQLite storage first (most up-to-date)
         match self.storage.get_request(request_id).await {
             Ok(Some(request)) => {
-                // Also update memory cache
-                let mut requests_guard = self.active_requests.write().await;
-                requests_guard.insert(request_id.to_string(), request.clone());
+                // Cache only active requests; terminal ones stay in storage only
+                match request.status {
+                    ProofRequestStatus::Fulfilled { .. } | ProofRequestStatus::Failed { .. } => {
+                        // Ensure any stale in-memory entry is cleared
+                        let mut requests_guard = self.active_requests.write().await;
+                        requests_guard.remove(request_id);
+                    }
+                    _ => {
+                        let mut requests_guard = self.active_requests.write().await;
+                        requests_guard.insert(request_id.to_string(), request.clone());
+                    }
+                }
                 Some(request)
             }
             Ok(None) => {
@@ -1398,7 +1423,11 @@ impl BoundlessProver {
                     e
                 );
                 let requests_guard = self.active_requests.read().await;
-                requests_guard.values().cloned().collect()
+                requests_guard
+                    .values()
+                    .filter(|req| !matches!(req.status, ProofRequestStatus::Fulfilled { .. } | ProofRequestStatus::Failed { .. }))
+                    .cloned()
+                    .collect()
             }
         }
     }
@@ -1424,18 +1453,23 @@ impl BoundlessProver {
     }
 
     /// Start background TTL cleanup task that runs every 24 hours
-    fn start_ttl_cleanup_task(
+    async fn start_ttl_cleanup_task(
         storage: BoundlessStorage,
         active_requests: Arc<RwLock<HashMap<String, AsyncProofRequest>>>,
     ) {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(24 * 3600)); // 24 hours
+        let mut handle_guard = ttl_cleanup_handle().lock().await;
+        if let Some(handle) = handle_guard.take() {
+            handle.abort();
+        }
+
+        let cleanup_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(3600)); // Run hourly
             interval.tick().await; // Skip first immediate tick
 
             loop {
                 interval.tick().await;
 
-                tracing::info!("Running TTL cleanup for completed requests older than 7 days");
+                tracing::info!("Running TTL cleanup for completed requests older than 12 hours");
 
                 match storage.delete_expired_ttl_requests().await {
                     Ok(deleted_ids) => {
@@ -1460,6 +1494,8 @@ impl BoundlessProver {
                 }
             }
         });
+
+        *handle_guard = Some(cleanup_task);
     }
 
     async fn evaluate_cost(&self, guest_env: &GuestEnv, elf: &[u8]) -> AgentResult<(u64, Vec<u8>)> {

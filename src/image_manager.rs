@@ -1,7 +1,10 @@
 use crate::AgentError;
 use alloy_primitives_v1p2p0::hex;
 use risc0_zkvm::{compute_image_id, sha::Digest};
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 use tokio::sync::RwLock;
 use url::Url;
 
@@ -14,6 +17,8 @@ pub struct ImageInfo {
     pub market_url: Url,
     /// The original ELF bytes (cached for potential re-upload)
     pub elf_bytes: Vec<u8>,
+    /// When to refresh the presigned URL before it expires
+    pub refresh_at: SystemTime,
 }
 
 /// Manages ELF images for both batch and aggregation proving
@@ -44,14 +49,42 @@ impl ImageManager {
             AgentError::ProgramUploadError(format!("Failed to compute image_id: {e}"))
         })?;
 
-        // Validate image type early
-        match image_type {
-            "batch" | "aggregation" => {}
+        // Validate image type early and load any existing cached entry
+        let existing = match image_type {
+            "batch" => self.batch_image.read().await.clone(),
+            "aggregation" => self.aggregation_image.read().await.clone(),
             _ => {
                 return Err(AgentError::RequestBuildError(format!(
                     "Invalid image type: {}. Must be 'batch' or 'aggregation'",
                     image_type
                 )));
+            }
+        };
+
+        // If the same image is already stored, reuse it and skip upload.
+        if let Some(existing_info) = existing {
+            if existing_info.image_id == image_id {
+                // Refresh presigned URL if nearing or past expiry
+                if SystemTime::now() < existing_info.refresh_at {
+                    tracing::info!(
+                        "{} image already uploaded. Reusing Image ID: {:?}",
+                        image_type,
+                        image_id
+                    );
+                    return Ok(existing_info);
+                }
+                tracing::info!(
+                    "{} image presigned URL nearing expiry; refreshing. Image ID: {:?}",
+                    image_type,
+                    image_id
+                );
+            } else {
+                tracing::warn!(
+                    "{} image differs from cached version. Replacing. Old ID: {:?}, New ID: {:?}",
+                    image_type,
+                    existing_info.image_id,
+                    image_id
+                );
             }
         }
 
@@ -62,9 +95,9 @@ impl ImageManager {
             elf_bytes.len() as f64 / 1_000_000.0
         );
 
-        let market_url = client.upload_program(&elf_bytes).await.map_err(|e| {
-            AgentError::ProgramUploadError(format!("{} upload failed: {e}", image_type))
-        })?;
+        let (market_url, refresh_at) = self
+            .upload_with_refresh_meta(image_type, &elf_bytes, client)
+            .await?;
 
         tracing::info!(
             "{} image uploaded successfully. Image ID: {:?}, URL: {}",
@@ -78,6 +111,7 @@ impl ImageManager {
             image_id,
             market_url,
             elf_bytes,
+            refresh_at,
         };
 
         // Store in the appropriate slot
@@ -197,6 +231,31 @@ impl ImageManager {
 
         Digest::try_from(bytes.as_slice())
             .map_err(|e| AgentError::RequestBuildError(format!("Invalid image_id format: {e}")))
+    }
+
+    /// Upload the program and compute a refresh deadline based on the presigned URL expiry.
+    async fn upload_with_refresh_meta(
+        &self,
+        image_type: &str,
+        elf_bytes: &[u8],
+        client: &boundless_market::Client,
+    ) -> Result<(Url, SystemTime), AgentError> {
+        let market_url = client.upload_program(elf_bytes).await.map_err(|e| {
+            AgentError::ProgramUploadError(format!("{} upload failed: {e}", image_type))
+        })?;
+
+        // Try to derive expiry from the presigned URL; fallback to 1h.
+        let expires_secs = market_url
+            .query_pairs()
+            .find(|(k, _)| k.eq_ignore_ascii_case("X-Amz-Expires"))
+            .and_then(|(_, v)| v.parse::<u64>().ok())
+            .unwrap_or(3600);
+
+        // Refresh a bit before actual expiry to avoid 403; default buffer 120s.
+        let refresh_at = SystemTime::now()
+            + Duration::from_secs(expires_secs.saturating_sub(120));
+
+        Ok((market_url, refresh_at))
     }
 }
 
