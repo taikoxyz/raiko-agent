@@ -1044,9 +1044,9 @@ impl BoundlessProver {
         })?;
 
         // Evaluate cost
-        let (mcycles_count, _) = self.evaluate_cost(&guest_env, elf).await
-            .map_err(|e| AgentError::GuestExecutionError(format!("Failed to evaluate cost: {}", e)))?;
-        let mcycles_count = 4000;
+        // let (mcycles_count, _) = self.evaluate_cost(&guest_env, elf).await
+        //     .map_err(|e| AgentError::GuestExecutionError(format!("Failed to evaluate cost: {}", e)))?;
+        let mcycles_count = 6000;
 
         // Upload input to storage so provers fetch from a URL (preferred over inline)
         tracing::info!(
