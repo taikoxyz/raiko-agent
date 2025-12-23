@@ -257,22 +257,59 @@ impl BoundlessStorage {
                         .unwrap()
                         .as_secs() as i64;
 
-                    // Extract proof data and error message from status
+                    // Extract proof data, error message, and optional market request ID
                     let (proof_data, error_message) = match &status {
                         ProofRequestStatus::Fulfilled { proof, .. } => (Some(proof.clone()), None),
                         ProofRequestStatus::Failed { error } => (None, Some(error.clone())),
                         _ => (None, None),
                     };
 
-                    conn.execute(
-                        r#"
-                        UPDATE boundless_requests 
-                        SET status = ?1, status_code = ?2, updated_at = ?3, proof_data = ?4, error_message = ?5
-                        WHERE request_id = ?6
-                        "#,
-                        params![status_json, status_code, now, proof_data, error_message, request_id],
-                    )
-                    .map_err(|e| e)?;
+                    let market_request_id_str = match &status {
+                        ProofRequestStatus::Submitted { market_request_id }
+                        | ProofRequestStatus::Locked { market_request_id, .. }
+                        | ProofRequestStatus::Fulfilled { market_request_id, .. } => {
+                            Some(format!("0x{:x}", market_request_id))
+                        }
+                        _ => None,
+                    };
+
+                    if let Some(market_request_id_str) = market_request_id_str {
+                        conn.execute(
+                            r#"
+                            UPDATE boundless_requests 
+                            SET status = ?1, status_code = ?2, updated_at = ?3, proof_data = ?4, error_message = ?5,
+                                market_request_id = ?6
+                            WHERE request_id = ?7
+                            "#,
+                            params![
+                                status_json,
+                                status_code,
+                                now,
+                                proof_data,
+                                error_message,
+                                market_request_id_str,
+                                request_id
+                            ],
+                        )
+                        .map_err(|e| e)?;
+                    } else {
+                        conn.execute(
+                            r#"
+                            UPDATE boundless_requests 
+                            SET status = ?1, status_code = ?2, updated_at = ?3, proof_data = ?4, error_message = ?5
+                            WHERE request_id = ?6
+                            "#,
+                            params![
+                                status_json,
+                                status_code,
+                                now,
+                                proof_data,
+                                error_message,
+                                request_id
+                            ],
+                        )
+                        .map_err(|e| e)?;
+                    }
 
                     Ok(())
                 })
@@ -554,7 +591,7 @@ impl BoundlessStorage {
             .map_err(|e| AgentError::ClientBuildError(format!("Failed to get request by input hash: {}", e)))
     }
 
-    /// Delete expired non-successful requests (older than 1 hour)
+    /// Delete expired non-successful requests (older than 2 hours)
     /// Returns list of deleted request IDs for memory cleanup
     pub async fn delete_expired_requests(&self) -> AgentResult<Vec<String>> {
         self.open_with_pragmas()
@@ -566,7 +603,7 @@ impl BoundlessStorage {
                     .prepare(
                         r#"
                     SELECT request_id FROM boundless_requests 
-                    WHERE updated_at < (strftime('%s', 'now') - 3600)
+                    WHERE updated_at < (strftime('%s', 'now') - 7200)
                     AND ((status_code IS NOT NULL AND status_code NOT IN ('fulfilled','failed'))
                          OR (status_code IS NULL AND status NOT LIKE '%Fulfilled%'))
                     "#,
@@ -595,7 +632,7 @@ impl BoundlessStorage {
                     .execute(
                         r#"
                     DELETE FROM boundless_requests 
-                    WHERE updated_at < (strftime('%s', 'now') - 3600)
+                    WHERE updated_at < (strftime('%s', 'now') - 7200)
                     AND status NOT LIKE '%Fulfilled%'
                     "#,
                         [],

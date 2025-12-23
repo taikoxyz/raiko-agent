@@ -24,6 +24,9 @@ export BOUNDLESS_SIGNER_KEY=0x...
   --config-file config/boundless_config_docker.json
 
 curl http://localhost:9999/health
+
+# If BOUNDLESS_API_KEY is set, include it in requests:
+curl -H "x-api-key: $BOUNDLESS_API_KEY" http://localhost:9999/requests
 ```
 
 OpenAPI docs are exposed at `/docs`, `/scalar`, and `/openapi.json`.
@@ -49,6 +52,7 @@ The service can load a JSON config via `--config-file` and merges it with defaul
 - `BOUNDLESS_SIGNER_KEY` (required): private key used to sign transactions
 - `SQLITE_DB_PATH` (optional): defaults to `./boundless_requests.db`
 - `RATE_LIMIT_PER_MINUTE` (optional): defaults to `100`
+- `BOUNDLESS_API_KEY` (optional): if set, non-health endpoints require `x-api-key` or `Authorization: Bearer`
 
 ## Docker
 

@@ -1,4 +1,5 @@
 pub mod api;
+pub mod auth;
 pub mod boundless;
 pub mod image_manager;
 pub mod rate_limit;
@@ -15,6 +16,7 @@ pub use storage::{BoundlessStorage, DatabaseStats};
 use axum::{
     Router,
     extract::DefaultBodyLimit,
+    middleware,
     routing::{delete, get, post},
 };
 use std::sync::Arc;
@@ -34,19 +36,23 @@ use api::{
 #[derive(Debug, Clone)]
 pub struct AppState {
     prover: Arc<Mutex<Option<BoundlessProver>>>,
-    prover_init_time: Arc<Mutex<Option<std::time::Instant>>>,
     rate_limiter: RateLimiter,
     image_manager: ImageManager,
+    api_key: Option<String>,
 }
 
 impl AppState {
-    fn new() -> Self {
+    fn new(api_key: Option<String>) -> Self {
         Self {
             prover: Arc::new(Mutex::new(None)),
-            prover_init_time: Arc::new(Mutex::new(None)),
             rate_limiter: RateLimiter::from_env(),
             image_manager: ImageManager::new(),
+            api_key,
         }
+    }
+
+    pub(crate) fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
     }
 
     async fn init_prover(&self, config: ProverConfig) -> AgentResult<BoundlessProver> {
@@ -56,38 +62,17 @@ impl AppState {
                 AgentError::ClientBuildError(format!("Failed to initialize prover: {}", e))
             })?;
         self.prover.lock().await.replace(prover.clone());
-        self.prover_init_time
-            .lock()
-            .await
-            .replace(std::time::Instant::now());
         Ok(prover)
     }
 
-    /// Get the prover, re-initializing if TTL (3600s) has expired.
-    async fn get_or_refresh_prover(&self) -> AgentResult<BoundlessProver> {
+    /// Get the prover if initialized.
+    async fn get_prover(&self) -> AgentResult<BoundlessProver> {
         let mut prover_guard = self.prover.lock().await;
-        let config_guard = prover_guard.as_ref().unwrap().prover_config();
-        let mut time_guard = self.prover_init_time.lock().await;
-        let now = std::time::Instant::now();
-        let ttl = std::time::Duration::from_secs(config_guard.url_ttl);
-
-        let should_refresh = match *time_guard {
-            Some(init_time) => now.duration_since(init_time) > ttl,
-            None => true,
-        };
-
-        if should_refresh || prover_guard.is_none() {
-            tracing::info!("Prover TTL exceeded or not initialized, re-initializing prover...");
-            let prover = BoundlessProver::new(config_guard, self.image_manager.clone())
-                .await
-                .map_err(|e| {
-                    AgentError::ClientBuildError(format!("Failed to initialize prover: {}", e))
-                })?;
-            *prover_guard = Some(prover.clone());
-            *time_guard = Some(now);
-            Ok(prover)
-        } else {
-            Ok(prover_guard.as_ref().unwrap().clone())
+        match prover_guard.as_ref() {
+            Some(prover) => Ok(prover.clone()),
+            None => Err(AgentError::ClientBuildError(
+                "Prover not initialized".to_string(),
+            )),
         }
     }
 }
@@ -134,6 +119,10 @@ struct CmdArgs {
     /// Path to boundless config file (JSON format)
     #[arg(long)]
     config_file: Option<String>,
+
+    /// Optional API key required for all non-health requests
+    #[arg(long, env = "BOUNDLESS_API_KEY")]
+    api_key: Option<String>,
 }
 
 #[tokio::main]
@@ -154,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .allow_headers(Any);
 
     // Create app state
-    let state = AppState::new();
+    let state = AppState::new(args.api_key.clone());
 
     // Initialize the prover before starting the server
     tracing::info!("Initializing prover...");
@@ -220,6 +209,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/openapi.json",
             get(move || async move { axum::Json(docs) }),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_api_key,
+        ))
         .layer(DefaultBodyLimit::max(10000 * 1024 * 1024))
         .layer(cors)
         .with_state(state);
