@@ -1,0 +1,10 @@
+target
+.git
+.github
+.vscode
+**/*.log
+**/*.tmp
+tests
+stress_dev.log
+py-post.py
+py-post-async.py

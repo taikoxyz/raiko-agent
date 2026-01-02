@@ -183,7 +183,7 @@ pub async fn proof_handler(
         request.input.len()
     );
 
-    let prover = match state.get_or_refresh_prover().await {
+    let prover = match state.get_prover().await {
         Ok(prover) => prover,
         Err(e) => {
             tracing::error!("Failed to get prover: {}", e);
@@ -297,7 +297,7 @@ pub async fn get_async_proof_status(
         ));
     }
 
-    let prover = match state.get_or_refresh_prover().await {
+    let prover = match state.get_prover().await {
         Ok(prover) => prover,
         Err(_e) => {
             return Err((
@@ -351,7 +351,7 @@ pub async fn get_async_proof_status(
 pub async fn list_async_requests(
     State(state): State<AppState>,
 ) -> Result<Json<RequestListResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let prover = match state.get_or_refresh_prover().await {
+    let prover = match state.get_prover().await {
         Ok(prover) => prover,
         Err(_e) => {
             return Err((
@@ -397,7 +397,7 @@ pub async fn list_async_requests(
 pub async fn get_database_stats(
     State(state): State<AppState>,
 ) -> Result<Json<DatabaseStatsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let prover = match state.get_or_refresh_prover().await {
+    let prover = match state.get_prover().await {
         Ok(prover) => prover,
         Err(_e) => {
             return Err((
@@ -441,7 +441,7 @@ pub async fn get_database_stats(
 pub async fn delete_all_requests(
     State(state): State<AppState>,
 ) -> Result<Json<DeleteAllResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let prover = match state.get_or_refresh_prover().await {
+    let prover = match state.get_prover().await {
         Ok(prover) => prover,
         Err(_e) => {
             return Err((
@@ -561,7 +561,7 @@ pub async fn upload_image_handler(
     );
 
     // Get prover to access Boundless client
-    let prover = match state.get_or_refresh_prover().await {
+    let prover = match state.get_prover().await {
         Ok(prover) => prover,
         Err(e) => {
             tracing::error!("Failed to initialize prover: {:?}", e);

@@ -765,6 +765,8 @@ impl BoundlessProver {
             );
         }
 
+        prover.resume_pending_requests().await;
+
         // Start background TTL cleanup task
         Self::start_ttl_cleanup_task(prover.storage.clone(), prover.active_requests.clone()).await;
 
@@ -785,6 +787,48 @@ impl BoundlessProver {
 
     pub fn storage(&self) -> &BoundlessStorage {
         &self.storage
+    }
+
+    async fn resume_pending_requests(&self) {
+        let pending = match self.storage.get_pending_requests().await {
+            Ok(requests) => requests,
+            Err(e) => {
+                tracing::warn!("Failed to load pending requests for resume: {}", e);
+                return;
+            }
+        };
+
+        if pending.is_empty() {
+            tracing::info!("No pending requests to resume");
+            return;
+        }
+
+        tracing::info!("Resuming polling for {} pending requests", pending.len());
+
+        for request in pending {
+            if request.market_request_id == U256::ZERO {
+                tracing::warn!(
+                    "Skipping pending request {} with empty market_request_id",
+                    request.request_id
+                );
+                continue;
+            }
+
+            let mut requests_guard = self.active_requests.write().await;
+            if requests_guard.contains_key(&request.request_id) {
+                continue;
+            }
+            requests_guard.insert(request.request_id.clone(), request.clone());
+            drop(requests_guard);
+
+            self.start_status_polling(
+                &request.request_id,
+                request.market_request_id,
+                request.proof_type.clone(),
+                self.active_requests.clone(),
+            )
+            .await;
+        }
     }
 
     /// Helper method to prepare and store async request
@@ -1046,7 +1090,10 @@ impl BoundlessProver {
         // Evaluate cost
         // let (mcycles_count, _) = self.evaluate_cost(&guest_env, elf).await
         //     .map_err(|e| AgentError::GuestExecutionError(format!("Failed to evaluate cost: {}", e)))?;
-        let mcycles_count = 6000;
+        let mcycles_count = match proof_type {
+            ProofType::Aggregate => 200,
+            ProofType::Batch | ProofType::Update(_) => 6000,
+        };
 
         // Upload input to storage so provers fetch from a URL (preferred over inline)
         tracing::info!(
