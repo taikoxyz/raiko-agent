@@ -1,28 +1,20 @@
-use alloy_primitives_v1p2p0::U256;
 use serde::{Deserialize, Serialize};
 #[allow(unused_imports)]
 use serde_json::json;
 use utoipa::ToSchema;
 
-use crate::ElfType;
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-/// Type of proof to generate
-pub enum ProofType {
-    /// Generate a batch proof
-    Batch,
-    /// Aggregate multiple existing proofs
-    Aggregate,
-    /// Update ELF binary
-    Update(ElfType),
-}
+use crate::types::{ElfType, ProofType, ProverType};
 
 #[derive(Debug, Deserialize, ToSchema)]
 /// Request data for submitting an asynchronous proof request
 pub struct AsyncProofRequestData {
+    /// Prover backend type
+    #[schema(example = json!("boundless"))]
+    pub prover_type: ProverType,
     /// Binary input data as array of bytes
     #[schema(example = json!([1, 2, 3, 4, 5]))]
     pub input: Vec<u8>,
+    /// Expected output bytes
     #[schema(example = json!([1, 2, 3, 4, 5]))]
     pub output: Vec<u8>,
     /// Type of proof to generate
@@ -44,14 +36,18 @@ pub struct AsyncProofResponse {
     /// Unique identifier for tracking this request
     #[schema(example = "req_abc123def456")]
     pub request_id: String,
-    /// Boundless market order ID
-    #[schema(example = "123456789")]
-    pub market_request_id: U256,
+    /// Prover backend type
+    #[schema(example = "boundless")]
+    pub prover_type: ProverType,
+    /// Provider-specific request identifier
+    #[schema(example = json!("0x1234abcd"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_request_id: Option<String>,
     /// Current request status
     #[schema(example = "preparing")]
     pub status: String,
     /// Human-readable status description
-    #[schema(example = "Proof request received and preparing for market submission")]
+    #[schema(example = "Proof request received and preparing for submission")]
     pub message: String,
 }
 
@@ -61,9 +57,13 @@ pub struct DetailedStatusResponse {
     /// The original request identifier
     #[schema(example = "req_abc123def456")]
     pub request_id: String,
-    /// Boundless market order ID
-    #[schema(example = "123456789")]
-    pub market_request_id: U256,
+    /// Prover backend type
+    #[schema(example = "boundless")]
+    pub prover_type: ProverType,
+    /// Provider-specific request identifier
+    #[schema(example = json!("0x1234abcd"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_request_id: Option<String>,
     /// Current status
     #[schema(example = "in_progress")]
     pub status: String,
@@ -95,7 +95,7 @@ pub struct HealthResponse {
     #[schema(example = "healthy")]
     pub status: String,
     /// Service name
-    #[schema(example = "boundless-agent")]
+    #[schema(example = "raiko-agent")]
     pub service: String,
 }
 
@@ -131,15 +131,22 @@ pub struct ErrorResponse {
 #[derive(Debug, Serialize, ToSchema)]
 /// Response when uploading an ELF image
 pub struct UploadImageResponse {
-    /// Image ID computed from the ELF (8 u32 values)
+    /// Prover backend type
+    #[schema(example = "boundless")]
+    pub prover_type: ProverType,
+    /// ELF type
+    pub elf_type: ElfType,
+    /// Image ID computed from the ELF (8 u32 values) if provided by the backend
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = json!([3537337764u32, 1055695413u32, 664197713u32, 1225410428u32, 3705161813u32, 2151977348u32, 4164639052u32, 2614443474u32]))]
-    pub image_id: Vec<u32>,
+    pub image_id: Option<Vec<u32>>,
+    /// URL where the image is stored by the provider
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "https://storage.boundless.network/programs/abc123")]
+    pub provider_url: Option<String>,
     /// Status of the upload
     #[schema(example = "uploaded")]
     pub status: String, // "uploaded" or "already_exists"
-    /// URL where the image is stored in Boundless Market
-    #[schema(example = "https://storage.boundless.network/programs/abc123")]
-    pub market_url: String,
     /// Detailed message
     #[schema(example = "Image uploaded successfully")]
     pub message: String,
@@ -153,18 +160,23 @@ pub struct ImageCheckResponse {
     /// Image ID if it exists
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_id: Option<Vec<u32>>,
-    /// Market URL if it exists
+    /// Provider URL if it exists
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub market_url: Option<String>,
+    pub provider_url: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+/// Images available for a prover
+pub struct ProverImages {
+    pub prover_type: ProverType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<crate::image_manager::ImageDetails>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregation: Option<crate::image_manager::ImageDetails>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 /// Response containing information about uploaded images
 pub struct ImageInfoResponse {
-    /// Batch image details if uploaded
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub batch: Option<crate::image_manager::ImageDetails>,
-    /// Aggregation image details if uploaded
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub aggregation: Option<crate::image_manager::ImageDetails>,
+    pub provers: Vec<ProverImages>,
 }

@@ -1,11 +1,14 @@
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::time::timeout;
 
-use crate::image_manager::ImageManager;
-use crate::storage::BoundlessStorage;
+use crate::image_manager::{ImageInfo, ImageManager, ImageUploadResult};
+use crate::storage::RequestStorage;
+use crate::types::{
+    AgentError, AgentResult, AsyncProofRequest, ElfType, ProofRequestStatus, ProofType, ProverType,
+};
 use alloy_primitives_v1p2p0::{
-    U256, hex, keccak256,
+    U256,
     utils::{parse_ether, parse_units},
 };
 use alloy_signer_local_v1p0p12::PrivateKeySigner;
@@ -16,7 +19,7 @@ use boundless_market::{
     input::GuestEnv,
     request_builder::OfferParams,
 };
-use reqwest::Url;
+use url::Url;
 use risc0_ethereum_contracts_boundless::receipt::{Receipt as ContractReceipt, decode_seal};
 use risc0_zkvm::{compute_image_id, Digest, Receipt as ZkvmReceipt, Journal, default_executor};
 use serde::{Deserialize, Serialize};
@@ -25,61 +28,6 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
-use utoipa::ToSchema;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ProofRequestStatus {
-    Preparing,
-    Submitted {
-        market_request_id: U256,
-    },
-    Locked {
-        market_request_id: U256,
-        prover: Option<String>,
-    },
-    Fulfilled {
-        market_request_id: U256,
-        proof: Vec<u8>,
-    },
-    Failed {
-        error: String,
-    },
-}
-
-/// Async proof request tracking
-#[derive(Debug, Clone, Serialize)]
-pub struct AsyncProofRequest {
-    pub request_id: String,
-    pub market_request_id: U256,
-    pub status: ProofRequestStatus,
-    pub proof_type: ProofType,
-    pub input: Vec<u8>,
-    pub config: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub enum ElfType {
-    Batch,
-    Aggregation,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ProofType {
-    Batch,
-    Aggregate,
-    Update(ElfType),
-}
-
-/// Generate deterministic request ID from input and proof type
-pub fn generate_request_id(input: &[u8], proof_type: &ProofType) -> String {
-    let input_hash = keccak256(input);
-    let proof_type_str = match proof_type {
-        ProofType::Batch => "batch",
-        ProofType::Aggregate => "aggregate",
-        ProofType::Update(_) => "update",
-    };
-    format!("{}_{}", hex::encode(input_hash), proof_type_str)
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DeploymentType {
@@ -119,6 +67,11 @@ pub struct BoundlessAggregationGuestOutput {
 const MAX_RETRY_ATTEMPTS: u32 = 5;
 const MILLION_CYCLES: u64 = 1_000_000;
 const STAKE_TOKEN_DECIMALS: u8 = 18;
+
+fn parse_provider_request_id(provider_request_id: &str) -> Option<U256> {
+    let trimmed = provider_request_id.trim_start_matches("0x");
+    U256::from_str_radix(trimmed, 16).ok()
+}
 
 /// Generic retry function with exponential backoff
 async fn retry_with_backoff<F, Fut, T, E>(
@@ -188,47 +141,10 @@ pub struct BoundlessOfferParams {
     pub lock_collateral: String,
 }
 
-impl Default for BoundlessOfferParams {
-    fn default() -> Self {
-        Self {
-            ramp_up_sec: 200,
-            lock_timeout_ms_per_mcycle: 1000,
-            timeout_ms_per_mcycle: 3000,
-            max_price_per_mcycle: "0.00001".to_string(),
-            min_price_per_mcycle: "0.000003".to_string(),
-            lock_collateral: "0.0001".to_string(),
-        }
-    }
-}
-
-impl BoundlessOfferParams {
-    fn aggregation() -> Self {
-        Self {
-            ramp_up_sec: 200,
-            lock_timeout_ms_per_mcycle: 1000,
-            timeout_ms_per_mcycle: 3000,
-            max_price_per_mcycle: "0.00001".to_string(),
-            min_price_per_mcycle: "0.000003".to_string(),
-            lock_collateral: "0.0001".to_string(),
-        }
-    }
-
-    fn batch() -> Self {
-        Self {
-            ramp_up_sec: 1000,
-            lock_timeout_ms_per_mcycle: 5000,
-            timeout_ms_per_mcycle: 3600 * 3,
-            max_price_per_mcycle: "0.00003".to_string(),
-            min_price_per_mcycle: "0.000005".to_string(),
-            lock_collateral: "0.0001".to_string(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BoundlessConfig {
     pub deployment: Option<DeploymentConfig>,
-    pub offer_params: Option<OfferParamsConfig>,
+    pub offer_params: OfferParamsConfig,
     pub rpc_url: Option<String>,
 }
 
@@ -240,77 +156,11 @@ pub struct DeploymentConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OfferParamsConfig {
-    pub batch: Option<BoundlessOfferParams>,
-    pub aggregation: Option<BoundlessOfferParams>,
-}
-
-impl Default for BoundlessConfig {
-    fn default() -> Self {
-        Self {
-            deployment: Some(DeploymentConfig {
-                deployment_type: Some(DeploymentType::Sepolia),
-                overrides: None,
-            }),
-            offer_params: Some(OfferParamsConfig {
-                batch: Some(BoundlessOfferParams::batch()),
-                aggregation: Some(BoundlessOfferParams::aggregation()),
-            }),
-            rpc_url: None,
-        }
-    }
+    pub batch: BoundlessOfferParams,
+    pub aggregation: BoundlessOfferParams,
 }
 
 impl BoundlessConfig {
-    /// Merge this config with another config, taking values from other where provided
-    pub fn merge(&mut self, other: &BoundlessConfig) {
-        // Merge deployment config if provided
-        if let Some(other_deployment) = &other.deployment {
-            if let Some(ref mut deployment) = self.deployment {
-                // Merge deployment type
-                if let Some(deployment_type) = &other_deployment.deployment_type {
-                    deployment.deployment_type = Some(deployment_type.clone());
-                }
-
-                // Merge deployment overrides
-                if let Some(other_overrides) = &other_deployment.overrides {
-                    if let Some(ref mut overrides) = deployment.overrides {
-                        // Merge JSON objects
-                        if let (Some(obj1), Some(obj2)) =
-                            (overrides.as_object_mut(), other_overrides.as_object())
-                        {
-                            for (key, value) in obj2 {
-                                obj1.insert(key.clone(), value.clone());
-                            }
-                        }
-                    } else {
-                        deployment.overrides = Some(other_overrides.clone());
-                    }
-                }
-            } else {
-                self.deployment = Some(other_deployment.clone());
-            }
-        }
-
-        // Merge offer params if provided
-        if let Some(other_offer_params) = &other.offer_params {
-            if let Some(ref mut offer_params) = self.offer_params {
-                if let Some(batch) = &other_offer_params.batch {
-                    offer_params.batch = Some(batch.clone());
-                }
-                if let Some(aggregation) = &other_offer_params.aggregation {
-                    offer_params.aggregation = Some(aggregation.clone());
-                }
-            } else {
-                self.offer_params = Some(other_offer_params.clone());
-            }
-        }
-
-        // Merge rpc_url if provided
-        if let Some(rpc_url) = &other.rpc_url {
-            self.rpc_url = Some(rpc_url.clone());
-        }
-    }
-
     /// Get the effective deployment type, using default if not specified
     pub fn get_deployment_type(&self) -> DeploymentType {
         self.deployment
@@ -343,22 +193,14 @@ impl BoundlessConfig {
         deployment
     }
 
-    /// Get the effective batch offer params, using default if not specified
+    /// Get the effective batch offer params
     pub fn get_batch_offer_params(&self) -> BoundlessOfferParams {
-        self.offer_params
-            .as_ref()
-            .and_then(|o| o.batch.as_ref())
-            .cloned()
-            .unwrap_or_else(BoundlessOfferParams::batch)
+        self.offer_params.batch.clone()
     }
 
-    /// Get the effective aggregation offer params, using default if not specified
+    /// Get the effective aggregation offer params
     pub fn get_aggregation_offer_params(&self) -> BoundlessOfferParams {
-        self.offer_params
-            .as_ref()
-            .and_then(|o| o.aggregation.as_ref())
-            .cloned()
-            .unwrap_or_else(BoundlessOfferParams::aggregation)
+        self.offer_params.aggregation.clone()
     }
 }
 
@@ -371,26 +213,13 @@ pub struct ProverConfig {
     pub url_ttl: u64,
 }
 
-impl Default for ProverConfig {
-    fn default() -> Self {
-        ProverConfig {
-            offchain: false,
-            pull_interval: 10,
-            // rpc_url: "https://ethereum-sepolia-rpc.publicnode.com".to_string(),
-            rpc_url: "https://base-rpc.publicnode.com".to_string(),
-            boundless_config: BoundlessConfig::default(),
-            url_ttl: 1800,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct BoundlessProver {
     config: ProverConfig,
     deployment: Deployment,
     boundless_config: BoundlessConfig,
     active_requests: Arc<RwLock<HashMap<String, AsyncProofRequest>>>,
-    storage: BoundlessStorage,
+    storage: RequestStorage,
     image_manager: ImageManager,
 }
 
@@ -399,39 +228,6 @@ static TTL_CLEANUP_HANDLE: OnceLock<tokio::sync::Mutex<Option<JoinHandle<()>>>> 
 fn ttl_cleanup_handle() -> &'static tokio::sync::Mutex<Option<JoinHandle<()>>> {
     TTL_CLEANUP_HANDLE.get_or_init(|| tokio::sync::Mutex::new(None))
 }
-
-// More specific error types
-#[derive(Debug, thiserror::Error)]
-pub enum AgentError {
-    #[error("Failed to build boundless client: {0}")]
-    ClientBuildError(String),
-    #[error("Failed to encode guest environment: {0}")]
-    GuestEnvEncodeError(String),
-    #[error("Failed to upload input: {0}")]
-    UploadError(String),
-    #[error("Failed to upload program: {0}")]
-    ProgramUploadError(String),
-    #[error("Failed to build request: {0}")]
-    RequestBuildError(String),
-    #[error("Failed to submit request: {0}")]
-    RequestSubmitError(String),
-    #[error("Failed to wait for request fulfillment after {attempts} attempts: {error}")]
-    RequestFulfillmentError { attempts: u32, error: String },
-    #[error("Failed to encode response: {0}")]
-    ResponseEncodeError(String),
-    #[error("Failed to execute guest environment: {0}")]
-    GuestExecutionError(String),
-    #[error("Did not receive requested unaggregated receipt")]
-    InvalidReceiptError,
-    #[error("Missing journal in fulfillment data")]
-    MissingJournalError,
-    #[error("Failed to decode fulfillment data: {0}")]
-    FulfillmentDecodeError(String),
-    #[error("Storage provider is required")]
-    StorageProviderRequired,
-}
-
-pub type AgentResult<T> = Result<T, AgentError>;
 
 impl BoundlessProver {
     /// Create a deployment based on the configuration
@@ -545,7 +341,9 @@ impl BoundlessProver {
                             "Market status: MarketSubmitted({}) - open for bidding",
                             request_id_str
                         );
-                        Ok(ProofRequestStatus::Submitted { market_request_id })
+                        Ok(ProofRequestStatus::Submitted {
+                            provider_request_id: request_id_str.clone(),
+                        })
                     }
                     RequestStatus::Locked => {
                         tracing::info!(
@@ -553,7 +351,7 @@ impl BoundlessProver {
                             request_id_str
                         );
                         Ok(ProofRequestStatus::Locked {
-                            market_request_id,
+                            provider_request_id: request_id_str.clone(),
                             prover: None,
                         })
                     }
@@ -611,8 +409,10 @@ impl BoundlessProver {
                                 // Decode boundless receipt only for batch proofs using the uploaded batch image ID
                                 let receipt = match proof_type {
                                     ProofType::Batch => {
-                                        if let Some(batch_image_id) =
-                                            self.image_manager.get_batch_image_id().await
+                                        if let Some(batch_image_id) = self
+                                            .image_manager
+                                            .get_image_id(ProverType::Boundless, ElfType::Batch)
+                                            .await
                                         {
                                             match decode_seal(
                                                 seal.clone(),
@@ -649,7 +449,7 @@ impl BoundlessProver {
                                 })?;
 
                                 Ok(ProofRequestStatus::Fulfilled {
-                                    market_request_id,
+                                    provider_request_id: request_id_str.clone(),
                                     proof: proof_bytes,
                                 })
                             }
@@ -694,14 +494,15 @@ impl BoundlessProver {
         Ok((guest_env, guest_env_bytes))
     }
 
-    pub async fn new(config: ProverConfig, image_manager: ImageManager) -> AgentResult<Self> {
+    pub async fn new(
+        config: ProverConfig,
+        image_manager: ImageManager,
+        storage: RequestStorage,
+    ) -> AgentResult<Self> {
         let deployment = BoundlessProver::create_deployment(&config)?;
         tracing::info!("boundless deployment: {:?}", deployment);
 
         // Initialize SQLite storage
-        let db_path = std::env::var("SQLITE_DB_PATH")
-            .unwrap_or_else(|_| "./boundless_requests.db".to_string());
-        let storage = BoundlessStorage::new(db_path);
         storage.initialize().await?;
 
         // Clean up expired requests from previous runs
@@ -731,37 +532,47 @@ impl BoundlessProver {
         // Refresh market URLs if images exist in ImageManager
         // This ensures fresh presigned URLs after prover refresh/TTL expiration
         // The storage provider deduplicates content, so only new URLs are generated
-        if image_manager.get_batch_image().await.is_some()
-            || image_manager.get_aggregation_image().await.is_some()
+        if image_manager
+            .get_image(ProverType::Boundless, ElfType::Batch)
+            .await
+            .is_some()
+            || image_manager
+                .get_image(ProverType::Boundless, ElfType::Aggregation)
+                .await
+                .is_some()
         {
             tracing::info!("Refreshing market URLs for uploaded images (TTL refresh)...");
 
-            let client = prover.create_boundless_client().await?;
-
             // Refresh batch image URL if exists
-            if let Some(batch_info) = image_manager.get_batch_image().await {
+            if let Some(batch_info) = image_manager
+                .get_image(ProverType::Boundless, ElfType::Batch)
+                .await
+            {
                 tracing::info!(
                     "Refreshing batch image market URL (content already cached in storage)"
                 );
-                image_manager
-                    .store_and_upload_image("batch", batch_info.elf_bytes.clone(), &client)
+                prover
+                    .upload_image(ElfType::Batch, batch_info.elf_bytes.clone())
                     .await?;
             }
 
             // Refresh aggregation image URL if exists
-            if let Some(agg_info) = image_manager.get_aggregation_image().await {
+            if let Some(agg_info) = image_manager
+                .get_image(ProverType::Boundless, ElfType::Aggregation)
+                .await
+            {
                 tracing::info!(
                     "Refreshing aggregation image market URL (content already cached in storage)"
                 );
-                image_manager
-                    .store_and_upload_image("aggregation", agg_info.elf_bytes.clone(), &client)
+                prover
+                    .upload_image(ElfType::Aggregation, agg_info.elf_bytes.clone())
                     .await?;
             }
 
             tracing::info!("Market URLs refreshed successfully");
         } else {
             tracing::info!(
-                "BoundlessProver initialized. Images should be uploaded via /upload-image endpoint."
+                "BoundlessProver initialized. Upload images via /upload-image/boundless/batch or /upload-image/boundless/aggregation."
             );
         }
 
@@ -773,19 +584,134 @@ impl BoundlessProver {
         Ok(prover)
     }
 
+    pub async fn upload_image(
+        &self,
+        elf_type: ElfType,
+        elf_bytes: Vec<u8>,
+    ) -> AgentResult<ImageUploadResult> {
+        let image_label = match elf_type {
+            ElfType::Batch => "batch",
+            ElfType::Aggregation => "aggregation",
+        };
+
+        let image_id = compute_image_id(&elf_bytes).map_err(|e| {
+            AgentError::ProgramUploadError(format!("Failed to compute image_id: {e}"))
+        })?;
+
+        if let Some(existing_info) = self
+            .image_manager
+            .get_image(ProverType::Boundless, elf_type.clone())
+            .await
+        {
+            if existing_info.image_id == Some(image_id) {
+                if let Some(refresh_at) = existing_info.refresh_at {
+                    if SystemTime::now() < refresh_at {
+                        tracing::info!(
+                            "{} image already uploaded. Reusing image ID: {:?}",
+                            image_label,
+                            image_id
+                        );
+                        return Ok(ImageUploadResult {
+                            info: existing_info,
+                            reused: true,
+                        });
+                    }
+                }
+
+                tracing::info!(
+                    "{} image presigned URL nearing expiry; refreshing. Image ID: {:?}",
+                    image_label,
+                    image_id
+                );
+            } else {
+                tracing::warn!(
+                    "{} image differs from cached version. Replacing. Old ID: {:?}, New ID: {:?}",
+                    image_label,
+                    existing_info.image_id,
+                    image_id
+                );
+            }
+        }
+
+        tracing::info!(
+            "Uploading {} image to market ({:.2} MB)...",
+            image_label,
+            elf_bytes.len() as f64 / 1_000_000.0
+        );
+
+        let client = self.create_boundless_client().await?;
+        let (market_url, refresh_at) =
+            self.upload_with_refresh_meta(&elf_type, &elf_bytes, &client)
+                .await?;
+
+        tracing::info!(
+            "{} image uploaded successfully. Image ID: {:?}, URL: {}",
+            image_label,
+            image_id,
+            market_url
+        );
+
+        let info = ImageInfo {
+            image_id: Some(image_id),
+            remote_url: Some(market_url),
+            elf_bytes,
+            refresh_at: Some(refresh_at),
+        };
+
+        self.image_manager
+            .set_image(ProverType::Boundless, elf_type, info.clone())
+            .await;
+
+        Ok(ImageUploadResult {
+            info,
+            reused: false,
+        })
+    }
+
+    async fn upload_with_refresh_meta(
+        &self,
+        elf_type: &ElfType,
+        elf_bytes: &[u8],
+        client: &boundless_market::Client,
+    ) -> AgentResult<(Url, SystemTime)> {
+        let image_label = match elf_type {
+            ElfType::Batch => "batch",
+            ElfType::Aggregation => "aggregation",
+        };
+
+        let market_url = client.upload_program(elf_bytes).await.map_err(|e| {
+            AgentError::ProgramUploadError(format!("{} upload failed: {e}", image_label))
+        })?;
+
+        let expires_secs = market_url
+            .query_pairs()
+            .find(|(k, _)| k.eq_ignore_ascii_case("X-Amz-Expires"))
+            .and_then(|(_, v)| v.parse::<u64>().ok())
+            .unwrap_or(3600);
+
+        let refresh_at = SystemTime::now()
+            + Duration::from_secs(expires_secs.saturating_sub(120));
+
+        Ok((market_url, refresh_at))
+    }
+
     pub async fn get_batch_image_url(&self) -> Option<Url> {
-        self.image_manager.get_batch_image_url().await
+        self.image_manager
+            .get_image_url(ProverType::Boundless, ElfType::Batch)
+            .await
     }
 
     pub async fn get_aggregation_image_url(&self) -> Option<Url> {
-        self.image_manager.get_aggregation_image_url().await
+        self.image_manager
+            .get_image_url(ProverType::Boundless, ElfType::Aggregation)
+            .await
     }
 
     pub fn prover_config(&self) -> ProverConfig {
         self.config.clone()
     }
 
-    pub fn storage(&self) -> &BoundlessStorage {
+    pub fn storage(&self) -> &RequestStorage {
         &self.storage
     }
 
@@ -806,9 +732,30 @@ impl BoundlessProver {
         tracing::info!("Resuming polling for {} pending requests", pending.len());
 
         for request in pending {
-            if request.market_request_id == U256::ZERO {
+            if request.prover_type != ProverType::Boundless {
+                continue;
+            }
+
+            let Some(provider_request_id) = request.provider_request_id.as_ref() else {
                 tracing::warn!(
-                    "Skipping pending request {} with empty market_request_id",
+                    "Skipping pending request {} with missing provider_request_id",
+                    request.request_id
+                );
+                continue;
+            };
+
+            let Some(market_request_id) = parse_provider_request_id(provider_request_id) else {
+                tracing::warn!(
+                    "Skipping pending request {} with invalid provider_request_id {}",
+                    request.request_id,
+                    provider_request_id
+                );
+                continue;
+            };
+
+            if market_request_id == U256::ZERO {
+                tracing::warn!(
+                    "Skipping pending request {} with empty provider_request_id",
                     request.request_id
                 );
                 continue;
@@ -823,7 +770,7 @@ impl BoundlessProver {
 
             self.start_status_polling(
                 &request.request_id,
-                request.market_request_id,
+                market_request_id,
                 request.proof_type.clone(),
                 self.active_requests.clone(),
             )
@@ -851,7 +798,8 @@ impl BoundlessProver {
 
         let async_request = AsyncProofRequest {
             request_id: request_id.clone(),
-            market_request_id: U256::ZERO, // Will be set when submitted
+            prover_type: ProverType::Boundless,
+            provider_request_id: None,
             status: ProofRequestStatus::Preparing,
             proof_type,
             input,
@@ -902,20 +850,20 @@ impl BoundlessProver {
             let mut requests_guard = active_requests.write().await;
             if let Some(async_req) = requests_guard.get_mut(request_id) {
                 async_req.status = status.clone();
-                // Also update market_request_id field when available in status
+                // Also update provider_request_id field when available in status
                 match &status {
-                    ProofRequestStatus::Submitted { market_request_id } => {
-                        async_req.market_request_id = *market_request_id;
+                    ProofRequestStatus::Submitted {
+                        provider_request_id,
                     }
-                    ProofRequestStatus::Locked {
-                        market_request_id, ..
-                    } => {
-                        async_req.market_request_id = *market_request_id;
+                    | ProofRequestStatus::Locked {
+                        provider_request_id,
+                        ..
                     }
-                    ProofRequestStatus::Fulfilled {
-                        market_request_id, ..
+                    | ProofRequestStatus::Fulfilled {
+                        provider_request_id,
+                        ..
                     } => {
-                        async_req.market_request_id = *market_request_id;
+                        async_req.provider_request_id = Some(provider_request_id.clone());
                     }
                     _ => {}
                 }
@@ -1131,24 +1079,29 @@ impl BoundlessProver {
             .map_err(|e| {
                 AgentError::RequestSubmitError(format!("Failed to submit to market: {}", e))
             })?;
+        let provider_request_id = format!("0x{:x}", market_request_id);
 
-        // Update the stored request with new market_request_id
+        // Update the stored request with new provider_request_id
         {
             let mut requests_guard = active_requests.write().await;
             if let Some(async_req) = requests_guard.get_mut(request_id) {
-                async_req.market_request_id = market_request_id;
-                async_req.status = ProofRequestStatus::Submitted { market_request_id };
+                async_req.provider_request_id = Some(provider_request_id.clone());
+                async_req.status = ProofRequestStatus::Submitted {
+                    provider_request_id: provider_request_id.clone(),
+                };
             }
         }
 
-        // Update in SQLite storage with correct market_request_id
-        let submitted_status = ProofRequestStatus::Submitted { market_request_id };
+        // Update in SQLite storage with correct provider_request_id
+        let submitted_status = ProofRequestStatus::Submitted {
+            provider_request_id,
+        };
         if let Err(e) = self
             .storage
             .update_status(request_id, &submitted_status)
             .await
         {
-            tracing::warn!("Failed to update market request ID in storage: {}", e);
+            tracing::warn!("Failed to update provider request ID in storage: {}", e);
         }
 
         // Start polling market status in background
@@ -1169,7 +1122,7 @@ impl BoundlessProver {
         // Check for existing request with same input content for proper deduplication
         if let Some(existing_request) = self
             .storage
-            .get_request_by_input_hash(&input, &ProofType::Batch)
+            .get_request_by_input_hash(&input, &ProofType::Batch, &ProverType::Boundless)
             .await?
         {
             match &existing_request.status {
@@ -1255,7 +1208,11 @@ impl BoundlessProver {
             let offer_params = prover_clone.boundless_config.get_batch_offer_params();
 
             // Get image info from ImageManager
-            let image_info = match prover_clone.image_manager.get_batch_image().await {
+            let image_info = match prover_clone
+                .image_manager
+                .get_image(ProverType::Boundless, ElfType::Batch)
+                .await
+            {
                 Some(info) => info,
                 None => {
                     let err_msg =
@@ -1268,13 +1225,22 @@ impl BoundlessProver {
                 }
             };
 
+            let Some(image_url) = image_info.remote_url.clone() else {
+                let err_msg = "Batch image URL missing after upload.";
+                tracing::error!("{}", err_msg);
+                prover_clone
+                    .update_failed_status(&request_id_clone, err_msg.to_string())
+                    .await;
+                return;
+            };
+
             if let Err(e) = prover_clone
                 .process_and_submit_request(
                     &request_id_clone,
                     input,
                     output,
                     &image_info.elf_bytes,
-                    image_info.market_url,
+                    image_url,
                     offer_params,
                     ProofType::Batch,
                     active_requests,
@@ -1301,7 +1267,7 @@ impl BoundlessProver {
         // Check for existing request with same input content for proper deduplication
         if let Some(existing_request) = self
             .storage
-            .get_request_by_input_hash(&input, &ProofType::Aggregate)
+            .get_request_by_input_hash(&input, &ProofType::Aggregate, &ProverType::Boundless)
             .await?
         {
             match &existing_request.status {
@@ -1392,7 +1358,11 @@ impl BoundlessProver {
             let offer_params = prover_clone.boundless_config.get_aggregation_offer_params();
 
             // Get image info from ImageManager
-            let image_info = match prover_clone.image_manager.get_aggregation_image().await {
+            let image_info = match prover_clone
+                .image_manager
+                .get_image(ProverType::Boundless, ElfType::Aggregation)
+                .await
+            {
                 Some(info) => info,
                 None => {
                     let err_msg = "Aggregation image not uploaded. Please upload via /upload-image endpoint first.";
@@ -1404,13 +1374,22 @@ impl BoundlessProver {
                 }
             };
 
+            let Some(image_url) = image_info.remote_url.clone() else {
+                let err_msg = "Aggregation image URL missing after upload.";
+                tracing::error!("{}", err_msg);
+                prover_clone
+                    .update_failed_status(&request_id_clone, err_msg.to_string())
+                    .await;
+                return;
+            };
+
             if let Err(e) = prover_clone
                 .process_and_submit_request(
                     &request_id_clone,
                     input,
                     output,
                     &image_info.elf_bytes,
-                    image_info.market_url,
+                    image_url,
                     offer_params,
                     ProofType::Aggregate,
                     active_requests,
@@ -1475,7 +1454,10 @@ impl BoundlessProver {
     pub async fn list_active_requests(&self) -> Vec<AsyncProofRequest> {
         // Get from SQLite storage for most up-to-date data
         match self.storage.list_active_requests().await {
-            Ok(requests) => requests,
+            Ok(requests) => requests
+                .into_iter()
+                .filter(|req| req.prover_type == ProverType::Boundless)
+                .collect(),
             Err(e) => {
                 tracing::warn!(
                     "Failed to get requests from storage, falling back to memory: {}",
@@ -1513,7 +1495,7 @@ impl BoundlessProver {
 
     /// Start background TTL cleanup task that runs every 24 hours
     async fn start_ttl_cleanup_task(
-        storage: BoundlessStorage,
+        storage: RequestStorage,
         active_requests: Arc<RwLock<HashMap<String, AsyncProofRequest>>>,
     ) {
         let mut handle_guard = ttl_cleanup_handle().lock().await;
@@ -1668,6 +1650,7 @@ mod tests {
     use std::{str::FromStr, sync::Arc};
 
     use super::*;
+    use crate::storage::RequestStorage;
     use alloy_primitives_v1p2p0::hex;
     use env_logger;
     use ethers_contract::abigen;
@@ -1684,11 +1667,58 @@ mod tests {
         ]"#
     );
 
+    fn test_batch_offer_params() -> BoundlessOfferParams {
+        BoundlessOfferParams {
+            ramp_up_sec: 1000,
+            lock_timeout_ms_per_mcycle: 5000,
+            timeout_ms_per_mcycle: 3600 * 3,
+            max_price_per_mcycle: "0.00003".to_string(),
+            min_price_per_mcycle: "0.000005".to_string(),
+            lock_collateral: "0.0001".to_string(),
+        }
+    }
+
+    fn test_aggregation_offer_params() -> BoundlessOfferParams {
+        BoundlessOfferParams {
+            ramp_up_sec: 200,
+            lock_timeout_ms_per_mcycle: 1000,
+            timeout_ms_per_mcycle: 3000,
+            max_price_per_mcycle: "0.00001".to_string(),
+            min_price_per_mcycle: "0.000003".to_string(),
+            lock_collateral: "0.0001".to_string(),
+        }
+    }
+
+    fn test_offer_params_config() -> OfferParamsConfig {
+        OfferParamsConfig {
+            batch: test_batch_offer_params(),
+            aggregation: test_aggregation_offer_params(),
+        }
+    }
+
+    fn test_prover_config() -> ProverConfig {
+        ProverConfig {
+            offchain: false,
+            pull_interval: 10,
+            rpc_url: "https://base-rpc.publicnode.com".to_string(),
+            boundless_config: BoundlessConfig {
+                deployment: Some(DeploymentConfig {
+                    deployment_type: Some(DeploymentType::Sepolia),
+                    overrides: None,
+                }),
+                offer_params: test_offer_params_config(),
+                rpc_url: None,
+            },
+            url_ttl: 1800,
+        }
+    }
+
     #[tokio::test]
     async fn test_batch_run() {
         use crate::image_manager::ImageManager;
         let image_manager = ImageManager::new();
-        BoundlessProver::new(ProverConfig::default(), image_manager)
+        let storage = RequestStorage::new(":memory:".to_string());
+        BoundlessProver::new(test_prover_config(), image_manager, storage)
             .await
             .unwrap();
     }
@@ -1696,7 +1726,7 @@ mod tests {
     #[test]
     fn test_deployment_selection() {
         // Test Sepolia deployment
-        let mut config = ProverConfig::default();
+        let mut config = test_prover_config();
         config.boundless_config.deployment = Some(DeploymentConfig {
             deployment_type: Some(DeploymentType::Sepolia),
             overrides: None,
@@ -1752,7 +1782,8 @@ mod tests {
 
         let config = serde_json::Value::default();
         let image_manager = ImageManager::new();
-        let prover = BoundlessProver::new(ProverConfig::default(), image_manager)
+        let storage = RequestStorage::new(":memory:".to_string());
+        let prover = BoundlessProver::new(test_prover_config(), image_manager, storage)
             .await
             .unwrap();
 
@@ -1812,7 +1843,8 @@ mod tests {
 
         // Test async aggregation request submission
         let image_manager = ImageManager::new();
-        let prover = BoundlessProver::new(ProverConfig::default(), image_manager)
+        let storage = RequestStorage::new(":memory:".to_string());
+        let prover = BoundlessProver::new(test_prover_config(), image_manager, storage)
             .await
             .unwrap();
         let request_id = prover
@@ -1911,10 +1943,7 @@ mod tests {
                 deployment_type: Some(DeploymentType::Sepolia),
                 overrides: None,
             }),
-            offer_params: Some(OfferParamsConfig {
-                batch: Some(BoundlessOfferParams::batch()),
-                aggregation: Some(BoundlessOfferParams::aggregation()),
-            }),
+            offer_params: test_offer_params_config(),
             rpc_url: None,
         };
 
@@ -1938,10 +1967,7 @@ mod tests {
                 deployment_type: Some(DeploymentType::Base),
                 overrides: None,
             }),
-            offer_params: Some(OfferParamsConfig {
-                batch: Some(BoundlessOfferParams::batch()),
-                aggregation: Some(BoundlessOfferParams::aggregation()),
-            }),
+            offer_params: test_offer_params_config(),
             rpc_url: None,
         };
 
@@ -1960,36 +1986,6 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_config_override() {
-        // Create a config that only overrides deployment type
-        let partial_config = BoundlessConfig {
-            deployment: Some(DeploymentConfig {
-                deployment_type: Some(DeploymentType::Base),
-                overrides: None,
-            }),
-            offer_params: None,
-            rpc_url: None,
-        };
-
-        // Start with default config
-        let mut default_config = BoundlessConfig::default();
-
-        // Merge the partial config
-        default_config.merge(&partial_config);
-
-        // Verify that deployment type was overridden
-        assert_eq!(default_config.get_deployment_type(), DeploymentType::Base);
-
-        // Verify that offer params still use defaults
-        let batch_params = default_config.get_batch_offer_params();
-        let aggregation_params = default_config.get_aggregation_offer_params();
-
-        // These should match the default values
-        assert_eq!(batch_params.ramp_up_sec, 1000);
-        assert_eq!(aggregation_params.ramp_up_sec, 200);
-    }
-
-    #[test]
     fn test_deployment_overrides() {
         // Test deployment overrides functionality
         let overrides = serde_json::json!({
@@ -2001,7 +1997,7 @@ mod tests {
                 deployment_type: Some(DeploymentType::Sepolia),
                 overrides: Some(overrides),
             }),
-            offer_params: None,
+            offer_params: test_offer_params_config(),
             rpc_url: None,
         };
 
@@ -2018,7 +2014,7 @@ mod tests {
 
     #[test]
     fn test_offer_params_max_price() {
-        let offer_params = BoundlessOfferParams::batch();
+        let offer_params = test_batch_offer_params();
         let max_price_per_mcycle = parse_ether(&offer_params.max_price_per_mcycle)
             .expect("Failed to parse max_price_per_mcycle");
         let max_price = max_price_per_mcycle * U256::from(1000u64);
