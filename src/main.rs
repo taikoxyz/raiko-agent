@@ -164,7 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let registry = ProverRegistry::new(
         Some(boundless),
-        Some(ZiskProver::new(image_manager.clone())),
+        Some(ZiskProver::new(image_manager.clone(), storage.clone())),
         Some(BrevisPicoProver::new(image_manager.clone())),
     );
 

@@ -17,6 +17,20 @@ Boundless is implemented today; Zisk and Brevis (pico) are placeholders.
 cargo build --release
 ```
 
+## Zisk Setup (Agent)
+
+Zisk proving runs inside `raiko-agent`, so the agent host needs the Zisk toolchain.
+Use the install script (build-time only in Raiko still produces the ELFs):
+
+```bash
+./script/install-zisk.sh
+# Optional: precompute ROM/proving keys
+./script/install-zisk.sh --rom-setup
+```
+
+The script detects NVIDIA GPUs and sets `CUDA_ARCH` automatically when possible.
+You can override it via `CUDA_ARCH=sm_89 ./script/install-zisk.sh`.
+
 ## Run
 
 ```bash
