@@ -21,7 +21,7 @@ cargo build --release
 
 ```bash
 export BOUNDLESS_SIGNER_KEY=0x...
-./target/release/boundless-agent \
+./target/release/raiko-agent \
   --address 0.0.0.0 \
   --port 9999 \
   --config-file config/boundless_config_base_deployment.json
@@ -132,7 +132,7 @@ DOCKER_REPOSITORY=us-docker.pkg.dev/evmchain/images ./script/publish-image.sh <t
 Override image name (default: `raiko-agent`):
 
 ```bash
-IMAGE_NAME=boundless-agent ./script/publish-image.sh <tag>
+IMAGE_NAME=raiko-agent-custom ./script/publish-image.sh <tag>
 ```
 
 ## Development

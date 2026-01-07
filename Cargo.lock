@@ -2074,39 +2074,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "boundless-agent"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "alloy-signer-local",
- "axum",
- "bincode",
- "boundless-market",
- "clap",
- "env_logger",
- "ethers",
- "ethers-contract",
- "ethers-core",
- "ethers-providers",
- "log",
- "reqwest 0.11.27",
- "risc0-ethereum-contracts",
- "risc0-zkvm",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-rusqlite",
- "tower-http 0.5.2",
- "tracing",
- "url",
- "utoipa 4.2.3",
- "utoipa-scalar",
- "utoipa-swagger-ui",
-]
-
-[[package]]
 name = "boundless-market"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6249,6 +6216,39 @@ name = "radium"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
+
+[[package]]
+name = "raiko-agent"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-signer-local",
+ "axum",
+ "bincode",
+ "boundless-market",
+ "clap",
+ "env_logger",
+ "ethers",
+ "ethers-contract",
+ "ethers-core",
+ "ethers-providers",
+ "log",
+ "reqwest 0.11.27",
+ "risc0-ethereum-contracts",
+ "risc0-zkvm",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-rusqlite",
+ "tower-http 0.5.2",
+ "tracing",
+ "url",
+ "utoipa 4.2.3",
+ "utoipa-scalar",
+ "utoipa-swagger-ui",
+]
 
 [[package]]
 name = "rand"

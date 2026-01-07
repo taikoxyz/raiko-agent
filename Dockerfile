@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /opt/boundless-agent
+WORKDIR /opt/raiko-agent
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
@@ -28,7 +28,7 @@ RUN useradd -u 10001 -m -s /usr/sbin/nologin boundless
 
 RUN mkdir -p /etc/boundless /var/lib/boundless && chown -R boundless:boundless /var/lib/boundless
 
-COPY --from=builder /opt/boundless-agent/target/release/boundless-agent /usr/local/bin/boundless-agent
+COPY --from=builder /opt/raiko-agent/target/release/raiko-agent /usr/local/bin/raiko-agent
 COPY config/boundless_config_docker.json /etc/boundless/config.json
 
 ENV RUST_LOG=info
@@ -38,4 +38,4 @@ EXPOSE 9999
 
 USER boundless
 
-CMD ["/usr/local/bin/boundless-agent", "--address", "0.0.0.0", "--port", "9999", "--config-file", "/etc/boundless/config.json"]
+CMD ["/usr/local/bin/raiko-agent", "--address", "0.0.0.0", "--port", "9999", "--config-file", "/etc/boundless/config.json"]
