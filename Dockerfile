@@ -24,18 +24,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd -u 10001 -m -s /usr/sbin/nologin boundless
+RUN useradd -u 10001 -m -s /usr/sbin/nologin raiko
 
-RUN mkdir -p /etc/boundless /var/lib/boundless && chown -R boundless:boundless /var/lib/boundless
+RUN mkdir -p /etc/raiko-agent /var/lib/raiko-agent && chown -R raiko:raiko /var/lib/raiko-agent
 
 COPY --from=builder /opt/raiko-agent/target/release/raiko-agent /usr/local/bin/raiko-agent
-COPY config/boundless_config_docker.json /etc/boundless/config.json
+COPY config/boundless_config_docker.json /etc/raiko-agent/config.json
 
 ENV RUST_LOG=info
-ENV SQLITE_DB_PATH=/var/lib/boundless/boundless_requests.db
+ENV SQLITE_DB_PATH=/var/lib/raiko-agent/proof_requests.db
 
 EXPOSE 9999
 
-USER boundless
+USER raiko
 
-CMD ["/usr/local/bin/raiko-agent", "--address", "0.0.0.0", "--port", "9999", "--config-file", "/etc/boundless/config.json"]
+CMD ["/usr/local/bin/raiko-agent", "--address", "0.0.0.0", "--port", "9999", "--config-file", "/etc/raiko-agent/config.json"]
