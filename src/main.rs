@@ -134,6 +134,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "./proof_requests.db".to_string());
     let storage = RequestStorage::new(db_path);
 
+    tracing::info!("Initializing SQLite storage...");
+    storage.initialize().await?;
+    match storage.delete_expired_requests().await {
+        Ok(deleted_ids) => {
+            if !deleted_ids.is_empty() {
+                tracing::info!(
+                    "Cleaned up {} expired requests from previous runs",
+                    deleted_ids.len()
+                );
+            }
+        }
+        Err(e) => tracing::warn!("Failed to clean up expired requests: {}", e),
+    }
+
     tracing::info!("Initializing provers...");
 
     let boundless = if let Some(config_file) = args.config_file.as_ref() {

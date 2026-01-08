@@ -502,22 +502,6 @@ impl BoundlessProver {
         let deployment = BoundlessProver::create_deployment(&config)?;
         tracing::info!("boundless deployment: {:?}", deployment);
 
-        // Initialize SQLite storage
-        storage.initialize().await?;
-
-        // Clean up expired requests from previous runs
-        match storage.delete_expired_requests().await {
-            Ok(deleted_ids) => {
-                if !deleted_ids.is_empty() {
-                    tracing::info!(
-                        "Cleaned up {} expired requests from previous runs",
-                        deleted_ids.len()
-                    );
-                }
-            }
-            Err(e) => tracing::warn!("Failed to clean up expired requests: {}", e),
-        }
-
         let boundless_config = config.boundless_config.clone();
 
         let prover = BoundlessProver {
