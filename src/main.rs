@@ -136,34 +136,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Initializing provers...");
 
-    let config_file = args
-        .config_file
-        .as_ref()
-        .ok_or_else(|| "config-file is required".to_string())?;
-    let config_content = std::fs::read_to_string(config_file)
-        .map_err(|e| format!("Failed to read config file: {}", e))?;
-    let boundless_config: BoundlessConfig = serde_json::from_str(&config_content)
-        .map_err(|e| format!("Failed to parse config file: {}", e))?;
+    let boundless = if let Some(config_file) = args.config_file.as_ref() {
+        let config_content = std::fs::read_to_string(config_file)
+            .map_err(|e| format!("Failed to read config file: {}", e))?;
+        let boundless_config: BoundlessConfig = serde_json::from_str(&config_content)
+            .map_err(|e| format!("Failed to parse config file: {}", e))?;
 
-    let rpc_url = boundless_config.rpc_url.clone().unwrap_or(args.rpc_url);
+        let rpc_url = boundless_config.rpc_url.clone().unwrap_or(args.rpc_url);
 
-    let prover_config = ProverConfig {
-        offchain: args.offchain,
-        pull_interval: args.pull_interval,
-        rpc_url,
-        boundless_config,
-        url_ttl: args.url_ttl,
+        let prover_config = ProverConfig {
+            offchain: args.offchain,
+            pull_interval: args.pull_interval,
+            rpc_url,
+            boundless_config,
+            url_ttl: args.url_ttl,
+        };
+        tracing::info!("Start with prover config: {:?}", prover_config);
+
+        Some(
+            BoundlessProver::new(prover_config, image_manager.clone(), storage.clone())
+                .await
+                .map_err(|e| {
+                    AgentError::ClientBuildError(format!(
+                        "Failed to initialize boundless prover: {}",
+                        e
+                    ))
+                })?,
+        )
+    } else {
+        tracing::info!("Boundless config not provided; boundless prover disabled");
+        None
     };
-    tracing::info!("Start with prover config: {:?}", prover_config);
-
-    let boundless = BoundlessProver::new(prover_config, image_manager.clone(), storage.clone())
-        .await
-        .map_err(|e| {
-            AgentError::ClientBuildError(format!("Failed to initialize boundless prover: {}", e))
-        })?;
 
     let registry = ProverRegistry::new(
-        Some(boundless),
+        boundless,
         Some(ZiskProver::new(image_manager.clone(), storage.clone())),
         Some(BrevisPicoProver::new(image_manager.clone())),
     );

@@ -153,7 +153,7 @@ impl ZiskProver {
                 }
                 ProofType::Aggregate => {
                     prover
-                        .run_aggregation_proof(&request_id_clone, input)
+                        .run_aggregation_proof(&request_id_clone, input, output)
                         .await
                         .map(|resp| (resp, "aggregation".to_string()))
                 }
@@ -333,6 +333,7 @@ impl ZiskProver {
         &self,
         request_id: &str,
         input: Vec<u8>,
+        output: Vec<u8>,
     ) -> AgentResult<ZiskResponse> {
         let aggregation_image = self
             .image_manager
@@ -345,6 +346,19 @@ impl ZiskProver {
                 )
             })?;
 
+        let expected_input = if output.is_empty() {
+            None
+        } else if output.len() == 32 {
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&output);
+            Some(bytes)
+        } else {
+            return Err(AgentError::RequestBuildError(format!(
+                "Invalid aggregation output length: expected 32 bytes, got {}",
+                output.len()
+            )));
+        };
+
         let config = self.config.clone();
         let aggregation_elf_bytes = aggregation_image.elf_bytes.clone();
         let request_id = request_id.to_string();
@@ -356,6 +370,7 @@ impl ZiskProver {
                 execute_aggregation_proof(
                     &request_id,
                     &input,
+                    expected_input,
                     &aggregation_elf_bytes,
                     &config,
                 )
@@ -830,6 +845,7 @@ async fn execute_batch_proof(
 async fn execute_aggregation_proof(
     request_id: &str,
     input_data: &[u8],
+    expected_input: Option<[u8; 32]>,
     aggregation_elf_bytes: &[u8],
     config: &ZiskProverConfig,
 ) -> Result<ZiskResponse> {
@@ -890,6 +906,15 @@ async fn execute_aggregation_proof(
     }
 
     let public_input = read_public_input_from_output(&output_dir)?;
+    if let Some(expected) = expected_input {
+        if public_input != expected {
+            return Err(anyhow!(
+                "Aggregation public input mismatch: guest={:?}, expected={:?}",
+                public_input,
+                expected
+            ));
+        }
+    }
 
     cleanup_intermediate_proofs(&output_dir);
 
