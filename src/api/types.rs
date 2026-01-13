@@ -18,9 +18,13 @@ pub struct AsyncProofRequestData {
     #[schema(example = json!([1, 2, 3, 4, 5]))]
     pub output: Vec<u8>,
     /// Type of proof to generate
+    ///
+    /// Note: `ProofType::Update` is deprecated; use `/upload-image/{prover_type}/{batch|aggregation}` instead.
     #[schema(example = json!("Batch"))]
     pub proof_type: ProofType,
     /// Optional ELF binary data for Update proof type
+    ///
+    /// Deprecated: use `/upload-image/{prover_type}/{batch|aggregation}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = json!(null))]
     pub elf: Option<Vec<u8>>,

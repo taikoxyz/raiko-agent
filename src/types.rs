@@ -59,6 +59,7 @@ pub enum ProofType {
     /// Aggregate multiple existing proofs
     Aggregate,
     /// Update ELF binary
+    #[deprecated(note = "Use /upload-image/{prover_type}/{batch|aggregation} instead.")]
     Update(ElfType),
 }
 

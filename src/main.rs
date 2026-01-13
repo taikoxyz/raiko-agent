@@ -185,7 +185,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = ProverRegistry::new(
         boundless,
         Some(ZiskProver::new(image_manager.clone(), storage.clone())),
-        Some(BrevisPicoProver::new(image_manager.clone())),
+        if cfg!(feature = "brevis_pico") {
+            Some(BrevisPicoProver::new(
+                image_manager.clone(),
+                storage.clone(),
+            ))
+        } else {
+            None
+        },
     );
 
     let state = AppState::new(args.api_key.clone(), registry, storage, image_manager);

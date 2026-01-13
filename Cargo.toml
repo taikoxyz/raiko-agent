@@ -23,6 +23,9 @@ thiserror = "1.0"
 bincode = "1.3.3"
 env_logger = "0.11.8"
 anyhow = "1.0"
+# Pico SDK (Brevis Pico zkVM) - requires nightly; gated behind feature.
+pico-sdk = { git = "https://github.com/brevis-network/pico", package = "pico-sdk", optional = true }
+pico-vm = { git = "https://github.com/brevis-network/pico", package = "pico-vm", optional = true }
 # SQLite dependencies for persistent storage
 rusqlite = { version = "0.31", features = ["bundled"] }
 tokio-rusqlite = "0.5"
@@ -50,3 +53,7 @@ default = []
 enable = []
 risc0 = []
 bench = []
+brevis_pico = ["dep:pico-sdk", "dep:pico-vm"]
+
+[patch.crates-io]
+risc0-zkvm-platform = { path = "vendor/risc0-zkvm-platform" }

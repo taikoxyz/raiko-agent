@@ -1396,7 +1396,10 @@ impl BoundlessProver {
         _elf: Vec<u8>,
         _elf_type: ElfType,
     ) -> AgentResult<String> {
-        todo!()
+        Err(AgentError::NotImplemented(
+            "ProofType::Update is deprecated; use /upload-image/{prover_type}/{batch|aggregation}"
+                .to_string(),
+        ))
     }
 
     /// Get the current status of an async request

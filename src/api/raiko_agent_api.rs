@@ -31,9 +31,9 @@ Client → Raiko Agent → Prover Backends
 ## Key Concepts
 - **Asynchronous Processing**: All proof requests are processed asynchronously
 - **Request Lifecycle**: Requests go through multiple states: preparing → submitted → in_progress → completed/failed
-- **Proof Types**: Supports batch proofs, aggregation proofs, and ELF update proofs
+- **Proof Types**: Supports batch proofs and aggregation proofs (`ProofType::Update` is deprecated; use `/upload-image/{prover_type}/{batch|aggregation}`)
 - **Multi-Prover Routing**: Requests are dispatched to a selected prover backend
-- **Prover Types**: `boundless` (implemented), `zisk` and `brevis_pico` (placeholders)
+- **Prover Types**: `boundless` (implemented), `zisk` (implemented), `brevis_pico` (implemented when built with `--features brevis_pico`)
         "#,
         contact(
             name = "Raiko Agent Support",
