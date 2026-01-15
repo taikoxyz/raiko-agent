@@ -6,7 +6,7 @@ Boundless is implemented today; Zisk and Brevis (pico) are placeholders.
 ## Features
 
 - **Async proof requests**: `/proof`, `/status/:request_id`, `/requests`, `DELETE /requests`, `/stats`
-- **Multi-prover routing**: `prover_type` = `boundless`, `zisk`, `brevis_pico`
+- **Multi-prover routing**: `prover_type` = `boundless`, `zisk`, `brevis`
 - **ELF upload workflow**: `/upload-image/{prover_type}/{batch|aggregation}` (per-prover in-memory cache)
 - **Image inventory**: `/images`
 - **SQLite persistence**: request tracking and cleanup on startup
@@ -79,7 +79,7 @@ Check image inventory:
 curl http://localhost:9999/images
 ```
 
-Note: `zisk` and `brevis_pico` proof submission returns `501 Not Implemented`, but ELF images
+Note: `zisk` and `brevis` proof submission returns `501 Not Implemented`, but ELF images
 can be staged for them.
 
 ## Configuration

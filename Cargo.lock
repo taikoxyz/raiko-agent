@@ -7218,6 +7218,7 @@ dependencies = [
  "ethers-providers",
  "log",
  "pico-sdk",
+ "pico-vm",
  "reqwest 0.11.27",
  "risc0-ethereum-contracts",
  "risc0-zkvm",
@@ -7961,6 +7962,8 @@ dependencies = [
 [[package]]
 name = "risc0-zkvm-platform"
 version = "2.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfaa10feba15828c788837ddde84b994393936d8f5715228627cfe8625122a40"
 dependencies = [
  "bytemuck",
  "cfg-if",

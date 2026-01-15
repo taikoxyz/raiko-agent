@@ -444,7 +444,7 @@ pub async fn delete_all_requests(
     path = "/upload-image/{prover_type}/{image_type}",
     tag = "Image Management",
     params(
-        ("prover_type" = String, Path, description = "Prover type: 'boundless', 'zisk', or 'brevis_pico'"),
+        ("prover_type" = String, Path, description = "Prover type: 'boundless', 'zisk', or 'brevis'"),
         ("image_type" = String, Path, description = "Type of image: 'batch' or 'aggregation'")
     ),
     request_body(

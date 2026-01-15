@@ -54,6 +54,4 @@ enable = []
 risc0 = []
 bench = []
 brevis_pico = ["dep:pico-sdk", "dep:pico-vm"]
-
-[patch.crates-io]
-risc0-zkvm-platform = { path = "vendor/risc0-zkvm-platform" }
+brevis_pico_evm = ["brevis_pico"]

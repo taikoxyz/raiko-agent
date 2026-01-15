@@ -1,25 +1,30 @@
 use crate::image_manager::{ImageInfo, ImageManager, ImageUploadResult};
 use crate::storage::RequestStorage;
-use crate::types::{AgentError, AgentResult, AsyncProofRequest, ElfType, ProofRequestStatus, ProofType, ProverType};
-use alloy_primitives_v1p2p0::{U256, hex};
+use crate::types::{
+    AgentError, AgentResult, AsyncProofRequest, ElfType, ProofRequestStatus, ProofType, ProverType,
+};
+use alloy_primitives_v1p2p0::{hex, U256};
 #[cfg(feature = "brevis_pico")]
 use alloy_primitives_v1p2p0::keccak256;
 #[cfg(feature = "brevis_pico")]
 use pico_vm::{
-    configs::{field_config::KoalaBearBn254, stark_config::KoalaBearPoseidon2},
+    configs::stark_config::KoalaBearPoseidon2,
     emulator::stdin::EmulatorStdinBuilder,
     machine::proof::MetaProof,
 };
-#[cfg(feature = "brevis_pico")]
+#[cfg(feature = "brevis_pico_evm")]
+use pico_vm::configs::field_config::KoalaBearBn254;
+#[cfg(feature = "brevis_pico_evm")]
 use pico_sdk::command::execute_command;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    process::Command,
     sync::Arc,
 };
+#[cfg(feature = "brevis_pico_evm")]
+use std::process::Command;
 #[cfg(feature = "brevis_pico")]
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
@@ -103,7 +108,7 @@ impl BrevisPicoProver {
         match &proof_type {
             ProofType::Update(_) => {
                 return Err(AgentError::NotImplemented(
-                    "ProofType::Update is deprecated; use /upload-image/brevis_pico/{batch|aggregation}"
+                    "ProofType::Update is deprecated; use /upload-image/brevis/{batch|aggregation}"
                         .to_string(),
                 ));
             }
@@ -112,7 +117,7 @@ impl BrevisPicoProver {
 
         if let Some(existing_request) = self
             .storage
-            .get_request_by_input_hash(&input, &proof_type, &ProverType::BrevisPico)
+            .get_request_by_input_hash(&input, &proof_type, &ProverType::Brevis)
             .await?
         {
             match &existing_request.status {
@@ -121,14 +126,14 @@ impl BrevisPicoProver {
                 | ProofRequestStatus::Locked { .. }
                 | ProofRequestStatus::Fulfilled { .. } => {
                     tracing::info!(
-                        "Returning existing brevis_pico request {} for identical input",
+                        "Returning existing brevis request {} for identical input",
                         existing_request.request_id
                     );
                     return Ok(existing_request.request_id);
                 }
                 ProofRequestStatus::Failed { error } => {
                     tracing::info!(
-                        "Found failed brevis_pico request for same input ({}), creating new request",
+                        "Found failed brevis request for same input ({}), creating new request",
                         error
                     );
                 }
@@ -150,14 +155,14 @@ impl BrevisPicoProver {
             let provider_request_id = request_id_clone.clone();
             let locked_status = ProofRequestStatus::Locked {
                 provider_request_id: provider_request_id.clone(),
-                prover: Some("brevis_pico".to_string()),
+                prover: Some("brevis".to_string()),
             };
             if let Err(e) = prover
                 .storage
                 .update_status(&request_id_clone, &locked_status)
                 .await
             {
-                tracing::warn!("Failed to update brevis_pico request status: {}", e);
+                tracing::warn!("Failed to update brevis request status: {}", e);
             }
 
             let result = match proof_type {
@@ -181,7 +186,7 @@ impl BrevisPicoProver {
                                 .update_failed_status(
                                     &request_id_clone,
                                     format!(
-                                        "Failed to serialize brevis_pico {} response: {}",
+                                        "Failed to serialize brevis {} response: {}",
                                         label, e
                                     ),
                                 )
@@ -195,7 +200,7 @@ impl BrevisPicoProver {
                     };
                     if let Err(e) = prover.storage.update_status(&request_id_clone, &fulfilled).await
                     {
-                        tracing::warn!("Failed to update fulfilled brevis_pico status: {}", e);
+                        tracing::warn!("Failed to update fulfilled brevis status: {}", e);
                     }
                 }
                 Err(err) => {
@@ -216,7 +221,7 @@ impl BrevisPicoProver {
     ) -> AgentResult<ImageUploadResult> {
         let reused = self
             .image_manager
-            .get_image(ProverType::BrevisPico, elf_type.clone())
+            .get_image(ProverType::Brevis, elf_type.clone())
             .await
             .map(|img| img.elf_bytes == elf_bytes)
             .unwrap_or(false);
@@ -229,7 +234,7 @@ impl BrevisPicoProver {
         };
 
         self.image_manager
-            .set_image(ProverType::BrevisPico, elf_type, info.clone())
+            .set_image(ProverType::Brevis, elf_type, info.clone())
             .await;
 
         Ok(ImageUploadResult { info, reused })
@@ -244,7 +249,7 @@ impl BrevisPicoProver {
     ) -> AgentResult<String> {
         let async_request = AsyncProofRequest {
             request_id: request_id.clone(),
-            prover_type: ProverType::BrevisPico,
+            prover_type: ProverType::Brevis,
             provider_request_id: None,
             status: ProofRequestStatus::Preparing,
             proof_type,
@@ -253,7 +258,7 @@ impl BrevisPicoProver {
         };
 
         if let Err(e) = self.storage.store_request(&async_request).await {
-            tracing::warn!("Failed to store brevis_pico request in SQLite: {}", e);
+            tracing::warn!("Failed to store brevis request in SQLite: {}", e);
         }
 
         Ok(request_id)
@@ -262,7 +267,7 @@ impl BrevisPicoProver {
     async fn update_failed_status(&self, request_id: &str, error: String) {
         let failed_status = ProofRequestStatus::Failed { error };
         if let Err(e) = self.storage.update_status(request_id, &failed_status).await {
-            tracing::warn!("Failed to update brevis_pico failed status: {}", e);
+            tracing::warn!("Failed to update brevis failed status: {}", e);
         }
     }
 
@@ -296,12 +301,12 @@ impl BrevisPicoProver {
 
             let image = self
                 .image_manager
-                .get_image(ProverType::BrevisPico, elf_type.clone())
+                .get_image(ProverType::Brevis, elf_type.clone())
                 .await
                 .ok_or_else(|| {
                     let label = elf_label(&elf_type);
                     AgentError::ProgramUploadError(format!(
-                        "Brevis Pico {} ELF not uploaded. Use /upload-image/brevis_pico/{}",
+                        "Brevis {} ELF not uploaded. Use /upload-image/brevis/{}",
                         label, label
                     ))
                 })?;
@@ -310,11 +315,11 @@ impl BrevisPicoProver {
             let batch_elf_bytes = if is_aggregation {
                 let batch_image = self
                     .image_manager
-                    .get_image(ProverType::BrevisPico, ElfType::Batch)
+                    .get_image(ProverType::Brevis, ElfType::Batch)
                     .await
                     .ok_or_else(|| {
                         AgentError::ProgramUploadError(
-                            "Brevis Pico batch ELF not uploaded; upload /upload-image/brevis_pico/batch"
+                            "Brevis batch ELF not uploaded; upload /upload-image/brevis/batch"
                                 .to_string(),
                         )
                     })?;
@@ -339,17 +344,13 @@ impl BrevisPicoProver {
                     })?;
                     let _lock_guard = program_lock.lock().await;
 
-                    tokio::task::spawn_blocking(move || {
-                        let client = DefaultProverClient::new(&elf_bytes);
-                        let riscv_vkey_hex = client.riscv_vk().hash_str_via_bn254();
-                        let program_dir = pico_cache_dir()
-                            .join("kb")
-                            .join("programs")
-                            .join(riscv_vkey_hex.trim_start_matches("0x"));
-
-                        let (guest_input, pico_proofs) = if is_aggregation {
-                                let wrapper: BrevisPicoAggregationInput =
-                                    bincode::deserialize(&input).map_err(|e| {
+	                    tokio::task::spawn_blocking(move || {
+	                        let client = DefaultProverClient::new(&elf_bytes);
+	                        let riscv_vkey_hex = client.riscv_vk().hash_str_via_bn254();
+	
+	                        let (guest_input, pico_proofs) = if is_aggregation {
+	                                let wrapper: BrevisPicoAggregationInput =
+	                                    bincode::deserialize(&input).map_err(|e| {
                                         anyhow!("Failed to decode brevis aggregation input: {e}")
                                     })?;
                                 if wrapper.pico_proofs.is_empty() {
@@ -377,13 +378,47 @@ impl BrevisPicoProver {
                             }
                         }
 
-                        let bundle = prove_evm_and_parse(&client, &program_dir, stdin_builder)?;
+                        let bundle = {
+                            #[cfg(feature = "brevis_pico_evm")]
+                            {
+                                let program_dir = pico_cache_dir()
+                                    .join("kb")
+                                    .join("programs")
+                                    .join(riscv_vkey_hex.trim_start_matches("0x"));
 
-                        tracing::info!(
-                            "Brevis Pico proof generated for request {} (program_dir={})",
-                            request_id,
-                            program_dir.display()
-                        );
+                                let bundle =
+                                    prove_evm_and_parse(&client, &program_dir, stdin_builder)?;
+
+                                tracing::info!(
+                                    "Brevis Pico proof generated for request {} (program_dir={})",
+                                    request_id,
+                                    program_dir.display()
+                                );
+
+                                bundle
+                            }
+
+                            #[cfg(not(feature = "brevis_pico_evm"))]
+                            {
+                                let (riscv_proof, _embed_proof) = client.prove(stdin_builder)?;
+
+                                let pico_proof = bincode::serialize(&riscv_proof).map_err(|e| {
+                                    anyhow!("Failed to serialize pico proof: {e}")
+                                })?;
+
+                                tracing::info!(
+                                    "Brevis Pico proof generated for request {} (pico only; EVM artifacts disabled)",
+                                    request_id
+                                );
+
+                                BrevisPicoProofBundle {
+                                    riscv_vkey: decode_bytes32(&riscv_vkey_hex)?,
+                                    public_values: Vec::new(),
+                                    proof: [U256::ZERO; 8],
+                                    pico_proof,
+                                }
+                            }
+                        };
 
                         Ok::<_, anyhow::Error>(bundle)
                     })
@@ -449,7 +484,7 @@ fn elf_label(elf_type: &ElfType) -> &'static str {
     }
 }
 
-#[cfg(feature = "brevis_pico")]
+#[cfg(feature = "brevis_pico_evm")]
 fn prove_evm_and_parse(
     client: &pico_sdk::client::KoalaBearProverClient,
     program_dir: &Path,

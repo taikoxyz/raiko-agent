@@ -6,19 +6,19 @@ use crate::types::{AgentError, AgentResult, ElfType, ProofType, ProverType};
 pub struct ProverRegistry {
     boundless: Option<BoundlessProver>,
     zisk: Option<ZiskProver>,
-    brevis_pico: Option<BrevisPicoProver>,
+    brevis: Option<BrevisPicoProver>,
 }
 
 impl ProverRegistry {
     pub fn new(
         boundless: Option<BoundlessProver>,
         zisk: Option<ZiskProver>,
-        brevis_pico: Option<BrevisPicoProver>,
+        brevis: Option<BrevisPicoProver>,
     ) -> Self {
         Self {
             boundless,
             zisk,
-            brevis_pico,
+            brevis,
         }
     }
 
@@ -30,8 +30,8 @@ impl ProverRegistry {
         if self.zisk.is_some() {
             provers.push(ProverType::Zisk);
         }
-        if self.brevis_pico.is_some() {
-            provers.push(ProverType::BrevisPico);
+        if self.brevis.is_some() {
+            provers.push(ProverType::Brevis);
         }
         provers
     }
@@ -74,7 +74,7 @@ impl ProverRegistry {
                 }
                 None => Err(AgentError::ProverUnavailable(prover_type.to_string())),
             },
-            ProverType::BrevisPico => match self.brevis_pico.as_ref() {
+            ProverType::Brevis => match self.brevis.as_ref() {
                 Some(prover) => {
                     prover
                         .submit_proof(request_id, proof_type, input, output, config, elf)
@@ -100,7 +100,7 @@ impl ProverRegistry {
                 Some(prover) => prover.upload_image(elf_type, elf_bytes).await,
                 None => Err(AgentError::ProverUnavailable(prover_type.to_string())),
             },
-            ProverType::BrevisPico => match self.brevis_pico.as_ref() {
+            ProverType::Brevis => match self.brevis.as_ref() {
                 Some(prover) => prover.upload_image(elf_type, elf_bytes).await,
                 None => Err(AgentError::ProverUnavailable(prover_type.to_string())),
             },
