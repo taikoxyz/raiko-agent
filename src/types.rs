@@ -9,7 +9,6 @@ use utoipa::ToSchema;
 pub enum ProverType {
     Boundless,
     Zisk,
-    #[serde(alias = "brevis_pico", alias = "pico")]
     Brevis,
 }
 
@@ -36,7 +35,7 @@ impl FromStr for ProverType {
         match s.to_lowercase().as_str() {
             "boundless" => Ok(ProverType::Boundless),
             "zisk" => Ok(ProverType::Zisk),
-            "brevis" | "brevis_pico" | "pico" => Ok(ProverType::Brevis),
+            "brevis" => Ok(ProverType::Brevis),
             _ => Err(format!(
                 "Invalid prover type: '{}'. Must be 'boundless', 'zisk', or 'brevis'",
                 s

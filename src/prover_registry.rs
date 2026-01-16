@@ -1,4 +1,4 @@
-use crate::backends::{brevis::BrevisPicoProver, boundless::BoundlessProver, zisk::ZiskProver};
+use crate::backends::{brevis::BrevisProver, boundless::BoundlessProver, zisk::ZiskProver};
 use crate::image_manager::ImageUploadResult;
 use crate::types::{AgentError, AgentResult, ElfType, ProofType, ProverType};
 
@@ -6,14 +6,14 @@ use crate::types::{AgentError, AgentResult, ElfType, ProofType, ProverType};
 pub struct ProverRegistry {
     boundless: Option<BoundlessProver>,
     zisk: Option<ZiskProver>,
-    brevis: Option<BrevisPicoProver>,
+    brevis: Option<BrevisProver>,
 }
 
 impl ProverRegistry {
     pub fn new(
         boundless: Option<BoundlessProver>,
         zisk: Option<ZiskProver>,
-        brevis: Option<BrevisPicoProver>,
+        brevis: Option<BrevisProver>,
     ) -> Self {
         Self {
             boundless,

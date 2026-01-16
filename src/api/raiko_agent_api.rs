@@ -33,7 +33,7 @@ Client → Raiko Agent → Prover Backends
 - **Request Lifecycle**: Requests go through multiple states: preparing → submitted → in_progress → completed/failed
 - **Proof Types**: Supports batch proofs and aggregation proofs (`ProofType::Update` is deprecated; use `/upload-image/{prover_type}/{batch|aggregation}`)
 - **Multi-Prover Routing**: Requests are dispatched to a selected prover backend
-- **Prover Types**: `boundless` (implemented), `zisk` (implemented), `brevis` (implemented when built with `--features brevis_pico`)
+- **Prover Types**: `boundless` (implemented), `zisk` (implemented), `brevis` (implemented when built with `--features brevis`)
         "#,
         contact(
             name = "Raiko Agent Support",

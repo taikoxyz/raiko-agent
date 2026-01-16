@@ -23,7 +23,7 @@ thiserror = "1.0"
 bincode = "1.3.3"
 env_logger = "0.11.8"
 anyhow = "1.0"
-# Pico SDK (Brevis Pico zkVM) - requires nightly; gated behind feature.
+# Pico zkVM (Brevis) - requires nightly; gated behind feature.
 pico-sdk = { git = "https://github.com/brevis-network/pico", package = "pico-sdk", optional = true }
 pico-vm = { git = "https://github.com/brevis-network/pico", package = "pico-vm", optional = true }
 # SQLite dependencies for persistent storage
@@ -53,5 +53,5 @@ default = []
 enable = []
 risc0 = []
 bench = []
-brevis_pico = ["dep:pico-sdk", "dep:pico-vm"]
-brevis_pico_evm = ["brevis_pico"]
+brevis = ["dep:pico-vm"]
+brevis_evm = ["brevis", "dep:pico-sdk"]

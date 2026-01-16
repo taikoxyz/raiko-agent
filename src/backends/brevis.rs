@@ -4,17 +4,21 @@ use crate::types::{
     AgentError, AgentResult, AsyncProofRequest, ElfType, ProofRequestStatus, ProofType, ProverType,
 };
 use alloy_primitives_v1p2p0::{hex, U256};
-#[cfg(feature = "brevis_pico")]
+#[cfg(feature = "brevis")]
 use alloy_primitives_v1p2p0::keccak256;
-#[cfg(feature = "brevis_pico")]
+#[cfg(feature = "brevis")]
 use pico_vm::{
+    compiler::riscv::program::Program,
+    configs::config::StarkGenericConfig,
     configs::stark_config::KoalaBearPoseidon2,
     emulator::stdin::EmulatorStdinBuilder,
     machine::proof::MetaProof,
+    machine::keys::{BaseVerifyingKey, HashableKey},
+    proverchain::{InitialProverSetup, MachineProver, RiscvProver},
 };
-#[cfg(feature = "brevis_pico_evm")]
+#[cfg(feature = "brevis_evm")]
 use pico_vm::configs::field_config::KoalaBearBn254;
-#[cfg(feature = "brevis_pico_evm")]
+#[cfg(feature = "brevis_evm")]
 use pico_sdk::command::execute_command;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -23,14 +27,39 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-#[cfg(feature = "brevis_pico_evm")]
+#[cfg(feature = "brevis_evm")]
 use std::process::Command;
-#[cfg(feature = "brevis_pico")]
+#[cfg(feature = "brevis")]
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
 
+#[cfg(feature = "brevis")]
+struct PicoRiscvClient {
+    riscv: RiscvProver<KoalaBearPoseidon2, Program>,
+}
+
+#[cfg(feature = "brevis")]
+impl PicoRiscvClient {
+    fn new(elf: &[u8]) -> Self {
+        let riscv = RiscvProver::new_initial_prover((KoalaBearPoseidon2::new(), elf), Default::default(), None);
+        Self { riscv }
+    }
+
+    fn vk(&self) -> &BaseVerifyingKey<KoalaBearPoseidon2> {
+        self.riscv.vk()
+    }
+
+    fn prove_riscv(
+        &self,
+        stdin: EmulatorStdinBuilder<Vec<u8>, KoalaBearPoseidon2>,
+    ) -> Result<MetaProof<KoalaBearPoseidon2>> {
+        let (stdin, _) = stdin.finalize();
+        Ok(self.riscv.prove(stdin))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BrevisPicoProofBundle {
+pub struct BrevisProofBundle {
     pub riscv_vkey: [u8; 32],
     pub public_values: Vec<u8>,
     pub proof: [U256; 8],
@@ -38,18 +67,18 @@ pub struct BrevisPicoProofBundle {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct BrevisPicoAggregationInput {
+struct BrevisAggregationInput {
     guest_input: Vec<u8>,
     pico_proofs: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
-pub struct BrevisPicoProverConfig {
+pub struct BrevisProverConfig {
     pub max_concurrency: usize,
     pub max_proof_timeout_secs: u64,
 }
 
-impl Default for BrevisPicoProverConfig {
+impl Default for BrevisProverConfig {
     fn default() -> Self {
         Self {
             max_concurrency: 1,
@@ -58,7 +87,7 @@ impl Default for BrevisPicoProverConfig {
     }
 }
 
-impl BrevisPicoProverConfig {
+impl BrevisProverConfig {
     pub fn from_env() -> Self {
         let defaults = Self::default();
         Self {
@@ -75,17 +104,17 @@ impl BrevisPicoProverConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct BrevisPicoProver {
+pub struct BrevisProver {
     image_manager: ImageManager,
     storage: RequestStorage,
-    config: BrevisPicoProverConfig,
+    config: BrevisProverConfig,
     concurrency: Arc<Semaphore>,
     program_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
-impl BrevisPicoProver {
+impl BrevisProver {
     pub fn new(image_manager: ImageManager, storage: RequestStorage) -> Self {
-        let config = BrevisPicoProverConfig::from_env();
+        let config = BrevisProverConfig::from_env();
         let concurrency = Arc::new(Semaphore::new(config.max_concurrency));
         Self {
             image_manager,
@@ -284,21 +313,17 @@ impl BrevisPicoProver {
         request_id: &str,
         elf_type: ElfType,
         input: Vec<u8>,
-    ) -> AgentResult<BrevisPicoProofBundle> {
-        #[cfg(not(feature = "brevis_pico"))]
+    ) -> AgentResult<BrevisProofBundle> {
+        #[cfg(not(feature = "brevis"))]
         {
             let _ = (request_id, elf_type, input);
             return Err(AgentError::NotImplemented(
-                "brevis_pico support requires building with `--features brevis_pico`"
-                    .to_string(),
+                "brevis support requires building with `--features brevis`".to_string(),
             ));
         }
 
-        #[cfg(feature = "brevis_pico")]
+        #[cfg(feature = "brevis")]
         {
-            use pico_sdk::client::DefaultProverClient;
-            use pico_sdk::HashableKey;
-
             let image = self
                 .image_manager
                 .get_image(ProverType::Brevis, elf_type.clone())
@@ -340,35 +365,33 @@ impl BrevisPicoProver {
                 Duration::from_secs(max_timeout),
                 async move {
                     let _permit = semaphore.acquire().await.map_err(|_| {
-                        anyhow!("Brevis Pico prover concurrency limiter closed unexpectedly")
+                        anyhow!("Brevis prover concurrency limiter closed unexpectedly")
                     })?;
                     let _lock_guard = program_lock.lock().await;
 
-	                    tokio::task::spawn_blocking(move || {
-	                        let client = DefaultProverClient::new(&elf_bytes);
-	                        let riscv_vkey_hex = client.riscv_vk().hash_str_via_bn254();
-	
-	                        let (guest_input, pico_proofs) = if is_aggregation {
-	                                let wrapper: BrevisPicoAggregationInput =
-	                                    bincode::deserialize(&input).map_err(|e| {
-                                        anyhow!("Failed to decode brevis aggregation input: {e}")
-                                    })?;
-                                if wrapper.pico_proofs.is_empty() {
-                                    return Err(anyhow!(
-                                        "Brevis Pico aggregation input missing pico proofs"
-                                    ));
-                                }
-                                (wrapper.guest_input, wrapper.pico_proofs)
+                    tokio::task::spawn_blocking(move || {
+                        let client = PicoRiscvClient::new(&elf_bytes);
+                        let riscv_vkey_hex = client.vk().hash_str_via_bn254();
+
+                        let (guest_input, pico_proofs) = if is_aggregation {
+                            let wrapper: BrevisAggregationInput =
+                                bincode::deserialize(&input).map_err(|e| {
+                                    anyhow!("Failed to decode brevis aggregation input: {e}")
+                                })?;
+                            if wrapper.pico_proofs.is_empty() {
+                                return Err(anyhow!("Brevis aggregation input missing pico proofs"));
+                            }
+                            (wrapper.guest_input, wrapper.pico_proofs)
                         } else {
                             (input, Vec::new())
                         };
 
-                        let mut stdin_builder = client.new_stdin_builder();
+                        let mut stdin_builder = EmulatorStdinBuilder::default();
                         stdin_builder.write_slice(&guest_input);
 
                         if let Some(batch_elf_bytes) = batch_elf_bytes {
-                            let batch_client = DefaultProverClient::new(&batch_elf_bytes);
-                            let batch_vk = batch_client.riscv_vk().clone();
+                            let batch_client = PicoRiscvClient::new(&batch_elf_bytes);
+                            let batch_vk = batch_client.vk().clone();
                             for proof_bytes in pico_proofs {
                                 let proof: MetaProof<KoalaBearPoseidon2> =
                                     bincode::deserialize(&proof_bytes).map_err(|e| {
@@ -379,18 +402,21 @@ impl BrevisPicoProver {
                         }
 
                         let bundle = {
-                            #[cfg(feature = "brevis_pico_evm")]
+                            #[cfg(feature = "brevis_evm")]
                             {
+                                use pico_sdk::client::KoalaBearProverClient;
+
+                                let evm_client = KoalaBearProverClient::new(&elf_bytes);
                                 let program_dir = pico_cache_dir()
                                     .join("kb")
                                     .join("programs")
                                     .join(riscv_vkey_hex.trim_start_matches("0x"));
 
                                 let bundle =
-                                    prove_evm_and_parse(&client, &program_dir, stdin_builder)?;
+                                    prove_evm_and_parse(&evm_client, &program_dir, stdin_builder)?;
 
                                 tracing::info!(
-                                    "Brevis Pico proof generated for request {} (program_dir={})",
+                                    "Brevis proof generated for request {} (program_dir={})",
                                     request_id,
                                     program_dir.display()
                                 );
@@ -398,20 +424,20 @@ impl BrevisPicoProver {
                                 bundle
                             }
 
-                            #[cfg(not(feature = "brevis_pico_evm"))]
+                            #[cfg(not(feature = "brevis_evm"))]
                             {
-                                let (riscv_proof, _embed_proof) = client.prove(stdin_builder)?;
+                                let riscv_proof = client.prove_riscv(stdin_builder)?;
 
                                 let pico_proof = bincode::serialize(&riscv_proof).map_err(|e| {
                                     anyhow!("Failed to serialize pico proof: {e}")
                                 })?;
 
                                 tracing::info!(
-                                    "Brevis Pico proof generated for request {} (pico only; EVM artifacts disabled)",
+                                    "Brevis proof generated for request {} (pico only; EVM artifacts disabled)",
                                     request_id
                                 );
 
-                                BrevisPicoProofBundle {
+                                BrevisProofBundle {
                                     riscv_vkey: decode_bytes32(&riscv_vkey_hex)?,
                                     public_values: Vec::new(),
                                     proof: [U256::ZERO; 8],
@@ -423,13 +449,13 @@ impl BrevisPicoProver {
                         Ok::<_, anyhow::Error>(bundle)
                     })
                     .await
-                    .map_err(|e| anyhow!("Brevis Pico prove task failed: {}", e))?
+                    .map_err(|e| anyhow!("Brevis prove task failed: {}", e))?
                 },
             )
             .await
             .map_err(|_| {
                 AgentError::GuestExecutionError(format!(
-                    "Brevis Pico proof timed out after {} seconds",
+                    "Brevis proof timed out after {} seconds",
                     max_timeout
                 ))
             })?
@@ -440,32 +466,29 @@ impl BrevisPicoProver {
     }
 
     fn compute_riscv_vkey_digest(&self, elf_bytes: &[u8]) -> Option<risc0_zkvm::sha::Digest> {
-        #[cfg(not(feature = "brevis_pico"))]
+        #[cfg(not(feature = "brevis"))]
         {
             let _ = elf_bytes;
             None
         }
 
-        #[cfg(feature = "brevis_pico")]
+        #[cfg(feature = "brevis")]
         {
-            use pico_sdk::client::DefaultProverClient;
-            use pico_sdk::HashableKey;
-
-            let client = DefaultProverClient::new(elf_bytes);
-            let riscv_vkey_hex = client.riscv_vk().hash_str_via_bn254();
+            let client = PicoRiscvClient::new(elf_bytes);
+            let riscv_vkey_hex = client.vk().hash_str_via_bn254();
             let bytes = decode_bytes32(&riscv_vkey_hex).ok()?;
             risc0_zkvm::sha::Digest::try_from(bytes.as_slice()).ok()
         }
     }
 }
 
-fn brevis_pico_base_dir() -> PathBuf {
+fn brevis_base_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("PICO_BASE_DIR") {
         if !dir.trim().is_empty() {
             return PathBuf::from(dir);
         }
     }
-    std::env::temp_dir().join("raiko-agent").join("brevis-pico")
+    std::env::temp_dir().join("raiko-agent").join("brevis")
 }
 
 fn pico_cache_dir() -> PathBuf {
@@ -474,7 +497,7 @@ fn pico_cache_dir() -> PathBuf {
             return PathBuf::from(dir);
         }
     }
-    brevis_pico_base_dir().join("pico-cache")
+    brevis_base_dir().join("pico-cache")
 }
 
 fn elf_label(elf_type: &ElfType) -> &'static str {
@@ -484,12 +507,12 @@ fn elf_label(elf_type: &ElfType) -> &'static str {
     }
 }
 
-#[cfg(feature = "brevis_pico_evm")]
+#[cfg(feature = "brevis_evm")]
 fn prove_evm_and_parse(
     client: &pico_sdk::client::KoalaBearProverClient,
     program_dir: &Path,
     stdin_builder: EmulatorStdinBuilder<Vec<u8>, KoalaBearPoseidon2>,
-) -> Result<BrevisPicoProofBundle>
+) -> Result<BrevisProofBundle>
 {
     std::fs::create_dir_all(program_dir)?;
 
@@ -535,7 +558,7 @@ fn prove_evm_and_parse(
 
     if !inputs_path.exists() {
         tracing::warn!(
-            "Brevis Pico inputs.json missing after prove (need_setup={}, retrying with setup)",
+            "Brevis inputs.json missing after prove (need_setup={}, retrying with setup)",
             need_setup
         );
 
@@ -571,7 +594,7 @@ fn prove_evm_and_parse(
     Ok(bundle)
 }
 
-fn parse_inputs_json(path: &Path) -> Result<BrevisPicoProofBundle> {
+fn parse_inputs_json(path: &Path) -> Result<BrevisProofBundle> {
     let contents =
         std::fs::read_to_string(path).map_err(|e| anyhow!("Failed to read {:?}: {}", path, e))?;
     let inputs: PicoInputsJson =
@@ -581,7 +604,7 @@ fn parse_inputs_json(path: &Path) -> Result<BrevisPicoProofBundle> {
     let public_values = decode_hex_bytes(&inputs.public_values)?;
     let proof = parse_u256_proof_array(&inputs.proof)?;
 
-    Ok(BrevisPicoProofBundle {
+    Ok(BrevisProofBundle {
         riscv_vkey,
         public_values,
         proof,
@@ -663,7 +686,7 @@ mod tests {
 
     #[test]
     fn test_parse_inputs_json_roundtrip() {
-        let dir = unique_temp_dir("brevis-pico-inputs");
+        let dir = unique_temp_dir("brevis-inputs");
         std::fs::create_dir_all(&dir).unwrap();
 
         let riscv_vkey = [0x11u8; 32];

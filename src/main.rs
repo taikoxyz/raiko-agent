@@ -34,7 +34,7 @@ use api::{
         image_info_handler, list_async_requests, proof_handler, upload_image_handler,
     },
 };
-use backends::{brevis::BrevisPicoProver, zisk::ZiskProver};
+use backends::{brevis::BrevisProver, zisk::ZiskProver};
 
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -185,8 +185,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = ProverRegistry::new(
         boundless,
         Some(ZiskProver::new(image_manager.clone(), storage.clone())),
-        if cfg!(feature = "brevis_pico") {
-            Some(BrevisPicoProver::new(
+        if cfg!(feature = "brevis") {
+            Some(BrevisProver::new(
                 image_manager.clone(),
                 storage.clone(),
             ))
