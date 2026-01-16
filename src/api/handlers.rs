@@ -58,7 +58,7 @@ fn map_status_to_api_response(request: &AsyncProofRequest) -> DetailedStatusResp
     };
 
     let provider_request_id = match &request.status {
-        ProofRequestStatus::Submitted { provider_request_id }
+        ProofRequestStatus::Submitted { provider_request_id, .. }
         | ProofRequestStatus::Locked {
             provider_request_id, ..
         }

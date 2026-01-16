@@ -317,9 +317,29 @@ impl BoundlessProver {
         &self,
         market_request_id: U256,
         proof_type: &ProofType,
+        expires_at: Option<u64>,
     ) -> AgentResult<ProofRequestStatus> {
         let boundless_client = self.create_boundless_client().await?;
         let request_id_str = format!("0x{:x}", market_request_id);
+
+        let effective_expires_at = match expires_at {
+            Some(expires_at) => Some(expires_at),
+            None => match boundless_client
+                .boundless_market
+                .get_submitted_request(market_request_id, None)
+                .await
+            {
+                Ok((request, _)) => Some(request.expires_at()),
+                Err(e) => {
+                    tracing::debug!(
+                        "Unable to resolve expires_at for {} (continuing without expiry check): {}",
+                        request_id_str,
+                        e
+                    );
+                    None
+                }
+            },
+        };
 
         // First, check the current status using get_status with retry logic
         let status_result = retry_with_backoff(
@@ -327,7 +347,7 @@ impl BoundlessProver {
             || {
                 boundless_client
                     .boundless_market
-                    .get_status(market_request_id, Some(u64::MAX))
+                    .get_status(market_request_id, effective_expires_at)
             },
             3, // Fewer retries for status checks since we poll periodically
         )
@@ -337,12 +357,20 @@ impl BoundlessProver {
             Ok(status) => {
                 match status {
                     RequestStatus::Unknown => {
-                        tracing::info!(
-                            "Market status: MarketSubmitted({}) - open for bidding",
-                            request_id_str
-                        );
+                        if effective_expires_at.is_some() {
+                            tracing::info!(
+                                "Market status: MarketSubmitted({}) - open for bidding",
+                                request_id_str
+                            );
+                        } else {
+                            tracing::info!(
+                                "Market status: MarketUnknown({}) - status unknown (open/expired/not-found)",
+                                request_id_str
+                            );
+                        }
                         Ok(ProofRequestStatus::Submitted {
                             provider_request_id: request_id_str.clone(),
+                            expires_at: effective_expires_at,
                         })
                     }
                     RequestStatus::Locked => {
@@ -353,6 +381,7 @@ impl BoundlessProver {
                         Ok(ProofRequestStatus::Locked {
                             provider_request_id: request_id_str.clone(),
                             prover: None,
+                            expires_at: effective_expires_at,
                         })
                     }
                     RequestStatus::Fulfilled => {
@@ -854,6 +883,7 @@ impl BoundlessProver {
                 match &status {
                     ProofRequestStatus::Submitted {
                         provider_request_id,
+                        ..
                     }
                     | ProofRequestStatus::Locked {
                         provider_request_id,
@@ -898,10 +928,21 @@ impl BoundlessProver {
     ) -> bool {
         let market_id_str = format!("0x{:x}", market_request_id);
 
+        let expires_at = {
+            let requests_guard = active_requests.read().await;
+            requests_guard
+                .get(request_id)
+                .and_then(|request| match &request.status {
+                    ProofRequestStatus::Submitted { expires_at, .. }
+                    | ProofRequestStatus::Locked { expires_at, .. } => *expires_at,
+                    _ => None,
+                })
+        };
+
         // Use retry logic for status polling to handle transient failures
         let status_result = retry_with_backoff(
             "check_market_status_polling",
-            || self.check_market_status(market_request_id, proof_type),
+            || self.check_market_status(market_request_id, proof_type, expires_at),
             3, // Fewer retries since we poll periodically
         )
         .await;
@@ -1071,6 +1112,7 @@ impl BoundlessProver {
             .map_err(|e| {
                 AgentError::RequestBuildError(format!("Failed to build request: {}", e))
             })?;
+        let expires_at = request.expires_at();
 
         // Submit to market
         let market_request_id = self
@@ -1088,6 +1130,7 @@ impl BoundlessProver {
                 async_req.provider_request_id = Some(provider_request_id.clone());
                 async_req.status = ProofRequestStatus::Submitted {
                     provider_request_id: provider_request_id.clone(),
+                    expires_at: Some(expires_at),
                 };
             }
         }
@@ -1095,6 +1138,7 @@ impl BoundlessProver {
         // Update in SQLite storage with correct provider_request_id
         let submitted_status = ProofRequestStatus::Submitted {
             provider_request_id,
+            expires_at: Some(expires_at),
         };
         if let Err(e) = self
             .storage

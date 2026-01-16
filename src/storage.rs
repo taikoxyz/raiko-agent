@@ -269,7 +269,7 @@ impl RequestStorage {
                     };
 
                     let provider_request_id = match &status {
-                        ProofRequestStatus::Submitted { provider_request_id }
+                        ProofRequestStatus::Submitted { provider_request_id, .. }
                         | ProofRequestStatus::Locked {
                             provider_request_id,
                             ..

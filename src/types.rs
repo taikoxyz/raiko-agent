@@ -67,10 +67,14 @@ pub enum ProofRequestStatus {
     Preparing,
     Submitted {
         provider_request_id: String,
+        /// Unix timestamp (seconds) when the market request expires (if known)
+        expires_at: Option<u64>,
     },
     Locked {
         provider_request_id: String,
         prover: Option<String>,
+        /// Unix timestamp (seconds) when the market request expires (if known)
+        expires_at: Option<u64>,
     },
     Fulfilled {
         provider_request_id: String,
