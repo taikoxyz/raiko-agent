@@ -402,68 +402,107 @@ impl BoundlessProver {
                         )
                         .await;
 
-                        match fulfillment_result {
-                            Ok(fulfillment) => {
-                                // Decode fulfillment data using the data() method first
-                                let journal = match fulfillment.data() {
-                                    Ok(fulfillment_data) => match fulfillment_data.journal() {
-                                        Some(j) => j.to_vec(),
-                                        None => {
-                                            tracing::error!(
-                                                "No journal found in fulfillment data for {}",
-                                                request_id_str
-                                            );
-                                            return Ok(ProofRequestStatus::Failed {
-                                                error: AgentError::MissingJournalError.to_string(),
-                                            });
-                                        }
-                                    },
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "Failed to decode fulfillment data for {}: {}",
-                                            request_id_str,
-                                            e
-                                        );
-                                        return Ok(ProofRequestStatus::Failed {
-                                            error: AgentError::FulfillmentDecodeError(
-                                                e.to_string(),
-                                            )
-                                            .to_string(),
-                                        });
-                                    }
-                                };
+	                        match fulfillment_result {
+	                            Ok(fulfillment) => {
+	                                let fulfillment_data = match fulfillment.data() {
+	                                    Ok(fulfillment_data) => fulfillment_data,
+	                                    Err(e) => {
+	                                        tracing::error!(
+	                                            "Failed to decode fulfillment data for {}: {}",
+	                                            request_id_str,
+	                                            e
+	                                        );
+	                                        return Ok(ProofRequestStatus::Failed {
+	                                            error: AgentError::FulfillmentDecodeError(
+	                                                e.to_string(),
+	                                            )
+	                                            .to_string(),
+	                                        });
+	                                    }
+	                                };
 
-                                let seal = fulfillment.seal;
+	                                let journal = match fulfillment_data.journal() {
+	                                    Some(j) => j.to_vec(),
+	                                    None => {
+	                                        tracing::error!(
+	                                            "No journal found in fulfillment data for {}",
+	                                            request_id_str
+	                                        );
+	                                        return Ok(ProofRequestStatus::Failed {
+	                                            error: AgentError::MissingJournalError.to_string(),
+	                                        });
+	                                    }
+	                                };
 
-                                // Decode boundless receipt only for batch proofs using the uploaded batch image ID
-                                let receipt = match proof_type {
-                                    ProofType::Batch => {
-                                        if let Some(batch_image_id) = self
-                                            .image_manager
-                                            .get_image_id(ProverType::Boundless, ElfType::Batch)
-                                            .await
-                                        {
-                                            match decode_seal(
-                                                seal.clone(),
-                                                crate::image_manager::ImageManager::digest_to_array(
-                                                    &batch_image_id,
-                                                ),
-                                                journal.clone(),
-                                            ) {
-                                                Ok(ContractReceipt::Base(boundless_receipt)) => {
-                                                    serde_json::to_string(&boundless_receipt).ok()
-                                                }
-                                                _ => None,
-                                            }
-                                        } else {
-                                            tracing::warn!(
-                                                "Batch image ID unavailable when decoding receipt"
-                                            );
-                                            None
-                                        }
-                                    }
-                                    _ => None, // Aggregation and other types get None
-                                };
+	                                let seal = fulfillment.seal;
+
+	                                // Decode boundless receipt only for batch proofs.
+	                                // Prefer the on-chain fulfillment image ID (survives agent restarts), fall back to
+	                                // cached image IDs if needed.
+	                                let receipt = match proof_type {
+	                                    ProofType::Batch => {
+	                                        let image_id = match fulfillment_data.image_id() {
+	                                            Some(image_id) => Some(image_id),
+	                                            None => {
+	                                                self.image_manager
+	                                                    .get_image_id(
+	                                                        ProverType::Boundless,
+	                                                        ElfType::Batch,
+	                                                    )
+	                                                    .await
+	                                            }
+	                                        };
+
+	                                        match image_id {
+	                                            Some(image_id) => {
+	                                                match decode_seal(
+	                                                    seal.clone(),
+	                                                    image_id,
+	                                                    journal.clone(),
+	                                                ) {
+	                                                    Ok(ContractReceipt::Base(
+	                                                        boundless_receipt,
+	                                                    )) => match serde_json::to_string(
+	                                                        &boundless_receipt,
+	                                                    ) {
+	                                                        Ok(json) => Some(json),
+	                                                        Err(e) => {
+	                                                            tracing::warn!(
+	                                                                "Failed to serialize decoded receipt for {}: {}",
+	                                                                request_id_str,
+	                                                                e
+	                                                            );
+	                                                            None
+	                                                        }
+	                                                    },
+	                                                    Ok(ContractReceipt::SetInclusion(_)) => {
+	                                                        tracing::warn!(
+	                                                            "Received set-inclusion receipt for batch proof {}",
+	                                                            request_id_str
+	                                                        );
+	                                                        None
+	                                                    }
+	                                                    Err(e) => {
+	                                                        tracing::warn!(
+	                                                            "Failed to decode receipt from seal for {}: {}",
+	                                                            request_id_str,
+	                                                            e
+	                                                        );
+	                                                        None
+	                                                    }
+	                                                }
+	                                            }
+	                                            None => {
+	                                                tracing::warn!(
+	                                                    "Image ID unavailable when decoding receipt for {}",
+	                                                    request_id_str
+	                                                );
+	                                                None
+	                                            }
+	                                        }
+	                                    }
+	                                    _ => None, // Aggregation and other types get None
+	                                };
 
                                 let response = Risc0Response {
                                     seal: seal.to_vec(),
@@ -1861,6 +1900,29 @@ mod tests {
 
         let zkvm_receipt: ZkvmReceipt = serde_json::from_str(&proof.receipt.unwrap()).unwrap();
         println!("Deserialized zkvm receipt: {:#?}", zkvm_receipt);
+    }
+
+    #[test]
+    fn test_decode_receipt_from_fixture_seal() {
+        let proof_bytes = std::fs::read("tests/fixtures/proof-1306738.bin").unwrap();
+        let response: Risc0Response = bincode::deserialize(&proof_bytes).unwrap();
+
+        let receipt_json = response
+            .receipt
+            .as_ref()
+            .expect("fixture should include a receipt");
+        let zkvm_receipt: ZkvmReceipt = serde_json::from_str(receipt_json).unwrap();
+
+        let claim = zkvm_receipt.claim().unwrap();
+        let image_id = claim.as_value().unwrap().pre.digest();
+        let seal = alloy_primitives_v1p2p0::Bytes::from(response.seal);
+
+        let decoded = decode_seal(seal, image_id, response.journal).unwrap();
+        let ContractReceipt::Base(decoded_receipt) = decoded else {
+            panic!("expected a base receipt");
+        };
+
+        assert_eq!(decoded_receipt.journal.bytes, zkvm_receipt.journal.bytes);
     }
 
     #[ignore = "requires storage provider (IPFS/Pinata)"]
