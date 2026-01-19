@@ -49,6 +49,13 @@ impl PicoRiscvClient {
         self.riscv.vk()
     }
 
+    fn verify_riscv(&self, proof: &MetaProof<KoalaBearPoseidon2>) -> Result<()> {
+        if !self.riscv.verify(proof, self.vk()) {
+            return Err(anyhow!("Pico proof verification failed"));
+        }
+        Ok(())
+    }
+
     fn prove_riscv(
         &self,
         stdin: EmulatorStdinBuilder<Vec<u8>, KoalaBearPoseidon2>,
@@ -76,6 +83,7 @@ struct BrevisAggregationInput {
 pub struct BrevisProverConfig {
     pub max_concurrency: usize,
     pub max_proof_timeout_secs: u64,
+    pub verify: bool,
 }
 
 impl Default for BrevisProverConfig {
@@ -83,6 +91,7 @@ impl Default for BrevisProverConfig {
         Self {
             max_concurrency: 1,
             max_proof_timeout_secs: 3600,
+            verify: true,
         }
     }
 }
@@ -99,6 +108,10 @@ impl BrevisProverConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(defaults.max_proof_timeout_secs),
+            verify: std::env::var("PICO_VERIFY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(defaults.verify),
         }
     }
 }
@@ -356,6 +369,7 @@ impl BrevisProver {
             let elf_bytes = image.elf_bytes.clone();
             let request_id = request_id.to_string();
             let max_timeout = self.config.max_proof_timeout_secs;
+            let verify = self.config.verify;
             let semaphore = self.concurrency.clone();
             let program_hash = hex::encode(keccak256(&elf_bytes));
             let lock_key = format!("{}:0x{}", elf_label(&elf_type), program_hash);
@@ -427,14 +441,18 @@ impl BrevisProver {
                             #[cfg(not(feature = "brevis_evm"))]
                             {
                                 let riscv_proof = client.prove_riscv(stdin_builder)?;
+                                if verify {
+                                    client.verify_riscv(&riscv_proof)?;
+                                }
 
                                 let pico_proof = bincode::serialize(&riscv_proof).map_err(|e| {
                                     anyhow!("Failed to serialize pico proof: {e}")
                                 })?;
 
                                 tracing::info!(
-                                    "Brevis proof generated for request {} (pico only; EVM artifacts disabled)",
-                                    request_id
+                                    "Brevis proof generated for request {} (pico only; EVM artifacts disabled, verified={})",
+                                    request_id,
+                                    verify
                                 );
 
                                 BrevisProofBundle {
