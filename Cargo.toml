@@ -1,5 +1,5 @@
 [package]
-name = "boundless-agent"
+name = "raiko-agent"
 version = "0.1.0"
 edition = "2024"
 

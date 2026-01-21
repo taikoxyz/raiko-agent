@@ -1,6 +1,6 @@
 use super::types::{
     AsyncProofRequestData, AsyncProofResponse, DatabaseStatsResponse, DeleteAllResponse,
-    DetailedStatusResponse, ErrorResponse, HealthResponse, ImageInfoResponse, ProofType,
+    DetailedStatusResponse, ErrorResponse, HealthResponse, ImageInfoResponse, ProverImages,
     RequestListResponse, UploadImageResponse,
 };
 use crate::api::handlers::{
@@ -9,43 +9,45 @@ use crate::api::handlers::{
     __path_proof_handler, __path_upload_image_handler,
 };
 use crate::image_manager::ImageDetails;
-use crate::{DatabaseStats, ElfType};
+use crate::types::{ElfType, ProofType, ProverType};
+use crate::DatabaseStats;
 use utoipa::OpenApi;
 
 #[derive(OpenApi)]
 #[openapi(
     info(
-        title = "Boundless Agent API",
+        title = "Raiko Agent API",
         version = "1.0.0",
         description = r#"
-REST API for Boundless Agent - Zero-knowledge proof generation via Boundless market
+REST API for Raiko Agent - Multi-prover proof generation service
 
-The Boundless Agent is a web service that acts as an intermediary between client applications and the Boundless market for zero-knowledge proof generation. It provides a REST API for submitting proof requests, monitoring their progress, and retrieving completed proofs.
+Raiko Agent is a web service that acts as an intermediary between client applications and multiple prover backends. It provides a REST API for submitting proof requests, monitoring their progress, and retrieving completed proofs.
 
 ## Architecture
 ```
-Client → Boundless Agent → Boundless Market
+Client → Raiko Agent → Prover Backends
 ```
 
 ## Key Concepts
 - **Asynchronous Processing**: All proof requests are processed asynchronously
 - **Request Lifecycle**: Requests go through multiple states: preparing → submitted → in_progress → completed/failed
-- **Proof Types**: Supports batch proofs, aggregation proofs, and ELF update proofs (coming soon)
-- **Market Integration**: Automatically handles Boundless market submission, pricing, and prover assignment
+- **Proof Types**: Supports batch proofs, aggregation proofs, and ELF update proofs
+- **Multi-Prover Routing**: Requests are dispatched to a selected prover backend
+- **Prover Types**: `boundless` (implemented), `zisk` and `brevis_pico` (placeholders)
         "#,
         contact(
-            name = "Boundless Agent Support",
-            url = "https://github.com/taikoxyz/boundless-agent",
+            name = "Raiko Agent Support",
+            url = "https://github.com/taikoxyz/raiko-agent",
             email = ""
         ),
         license(
             name = "MIT",
-            url = "https://github.com/taikoxyz/boundless-agent/blob/main/LICENSE"
+            url = "https://github.com/taikoxyz/raiko-agent/blob/main/LICENSE"
         )
     ),
     servers(
         (url = "http://localhost:9999", description = "Local development server"),
-        (url = "{protocol}://{host}:{port}", description = "Configurable server", 
+        (url = "{protocol}://{host}:{port}", description = "Configurable server",
             variables(
                 ("protocol" = (default = "http", enum_values("http", "https"))),
                 ("host" = (default = "localhost")),
@@ -68,6 +70,7 @@ Client → Boundless Agent → Boundless Market
         AsyncProofResponse,
         ProofType,
         ElfType,
+        ProverType,
         DetailedStatusResponse,
         RequestListResponse,
         HealthResponse,
@@ -77,6 +80,7 @@ Client → Boundless Agent → Boundless Market
         ErrorResponse,
         UploadImageResponse,
         ImageInfoResponse,
+        ProverImages,
         ImageDetails,
     )),
     tags(
@@ -87,14 +91,14 @@ Client → Boundless Agent → Boundless Market
         (name = "Image Management", description = "ELF image upload and management endpoints")
     ),
     external_docs(
-        url = "https://github.com/taikoxyz/boundless-agent#readme",
+        url = "https://github.com/taikoxyz/raiko-agent#readme",
         description = "Detailed API documentation and integration guide"
     )
 )]
-/// Boundless Agent OpenAPI Documentation
-pub struct BoundlessAgentApiDoc;
+/// Raiko Agent OpenAPI Documentation
+pub struct RaikoAgentApiDoc;
 
 /// Generate OpenAPI specification
 pub fn create_docs() -> utoipa::openapi::OpenApi {
-    BoundlessAgentApiDoc::openapi()
+    RaikoAgentApiDoc::openapi()
 }

@@ -1,21 +1,23 @@
-use crate::boundless::{AgentError, AgentResult, AsyncProofRequest, ProofRequestStatus, ProofType};
-use alloy_primitives_v1p2p0::U256;
+use crate::types::{
+    AgentError, AgentResult, AsyncProofRequest, ProofRequestStatus, ProofType, ProverType,
+};
 use alloy_primitives_v1p2p0::keccak256;
 use serde_json;
+use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::OnceCell;
 use tokio_rusqlite::params;
 use tracing;
 use utoipa::ToSchema;
 
-/// SQLite storage for persistent boundless request tracking
+/// SQLite storage for persistent prover request tracking
 #[derive(Debug, Clone)]
-pub struct BoundlessStorage {
+pub struct RequestStorage {
     db_path: String,
     pooled_conn: OnceCell<tokio_rusqlite::Connection>,
 }
 
-impl BoundlessStorage {
+impl RequestStorage {
     pub fn new(db_path: String) -> Self {
         Self {
             db_path,
@@ -73,9 +75,10 @@ impl BoundlessStorage {
                 Self::apply_pragmas(conn)?;
                 conn.execute(
                     r#"
-                    CREATE TABLE IF NOT EXISTS boundless_requests (
+                    CREATE TABLE IF NOT EXISTS proof_requests (
                         request_id TEXT PRIMARY KEY,
-                        market_request_id TEXT NOT NULL,
+                        prover_type TEXT NOT NULL,
+                        provider_request_id TEXT,
                         status TEXT NOT NULL,
                         status_code TEXT,
                         proof_type TEXT NOT NULL,
@@ -94,31 +97,31 @@ impl BoundlessStorage {
 
                 // Create index for faster status queries
                 conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_status ON boundless_requests(status)",
+                    "CREATE INDEX IF NOT EXISTS idx_status ON proof_requests(status)",
                     [],
                 ).map_err(|e| e)?;
 
                 // Migrate existing database by adding new columns if they don't exist
-                let _ = conn.execute("ALTER TABLE boundless_requests ADD COLUMN input_hash TEXT", []);
-                let _ = conn.execute("ALTER TABLE boundless_requests ADD COLUMN proof_type_str TEXT", []);
-                let _ = conn.execute("ALTER TABLE boundless_requests ADD COLUMN ttl_expires_at INTEGER", []);
-                let _ = conn.execute("ALTER TABLE boundless_requests ADD COLUMN status_code TEXT", []);
+                let _ = conn.execute("ALTER TABLE proof_requests ADD COLUMN input_hash TEXT", []);
+                let _ = conn.execute("ALTER TABLE proof_requests ADD COLUMN proof_type_str TEXT", []);
+                let _ = conn.execute("ALTER TABLE proof_requests ADD COLUMN ttl_expires_at INTEGER", []);
+                let _ = conn.execute("ALTER TABLE proof_requests ADD COLUMN status_code TEXT", []);
 
                 // Create unique index for input deduplication
                 conn.execute(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_input_dedup ON boundless_requests(input_hash, proof_type_str) WHERE input_hash IS NOT NULL AND proof_type_str IS NOT NULL",
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_input_dedup ON proof_requests(input_hash, proof_type_str, prover_type) WHERE input_hash IS NOT NULL AND proof_type_str IS NOT NULL",
                     [],
                 ).map_err(|e| e)?;
 
                 // Index for status_code based filtering
                 conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_status_code ON boundless_requests(status_code)",
+                    "CREATE INDEX IF NOT EXISTS idx_status_code ON proof_requests(status_code)",
                     [],
                 ).map_err(|e| e)?;
 
                 // Create index for TTL-based cleanup
                 conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_ttl_expires_at ON boundless_requests(ttl_expires_at)",
+                    "CREATE INDEX IF NOT EXISTS idx_ttl_expires_at ON proof_requests(ttl_expires_at)",
                     [],
                 ).map_err(|e| e)?;
 
@@ -171,7 +174,6 @@ impl BoundlessStorage {
                         .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
                     let config_json = serde_json::to_string(&req_clone.config)
                         .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
-                    let market_request_id_str = format!("0x{:x}", req_clone.market_request_id);
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
@@ -180,6 +182,7 @@ impl BoundlessStorage {
                     // Compute input hash and proof type string for deduplication
                     let input_hash = Self::compute_input_hash(&req_clone.input);
                     let proof_type_str = Self::proof_type_to_string(&req_clone.proof_type);
+                    let prover_type_str = req_clone.prover_type.as_str();
                     let status_code = Self::status_code(&req_clone.status);
 
                     // Set TTL to 12 hours from now (12 * 60 * 60 = 43200 seconds)
@@ -187,14 +190,15 @@ impl BoundlessStorage {
 
                     conn.execute(
                         r#"
-                        INSERT OR REPLACE INTO boundless_requests
-                        (request_id, market_request_id, status, status_code, proof_type, input_data, config_data,
+                        INSERT OR REPLACE INTO proof_requests
+                        (request_id, prover_type, provider_request_id, status, status_code, proof_type, input_data, config_data,
                          updated_at, proof_data, error_message, input_hash, proof_type_str, ttl_expires_at)
-                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                         "#,
                         params![
                             req_clone.request_id,
-                            market_request_id_str,
+                            prover_type_str,
+                            req_clone.provider_request_id,
                             status_json,
                             status_code,
                             proof_type_json,
@@ -257,28 +261,32 @@ impl BoundlessStorage {
                         .unwrap()
                         .as_secs() as i64;
 
-                    // Extract proof data, error message, and optional market request ID
+                    // Extract proof data, error message, and optional provider request ID
                     let (proof_data, error_message) = match &status {
                         ProofRequestStatus::Fulfilled { proof, .. } => (Some(proof.clone()), None),
                         ProofRequestStatus::Failed { error } => (None, Some(error.clone())),
                         _ => (None, None),
                     };
 
-                    let market_request_id_str = match &status {
-                        ProofRequestStatus::Submitted { market_request_id }
-                        | ProofRequestStatus::Locked { market_request_id, .. }
-                        | ProofRequestStatus::Fulfilled { market_request_id, .. } => {
-                            Some(format!("0x{:x}", market_request_id))
+                    let provider_request_id = match &status {
+                        ProofRequestStatus::Submitted { provider_request_id, .. }
+                        | ProofRequestStatus::Locked {
+                            provider_request_id,
+                            ..
                         }
+                        | ProofRequestStatus::Fulfilled {
+                            provider_request_id,
+                            ..
+                        } => Some(provider_request_id.clone()),
                         _ => None,
                     };
 
-                    if let Some(market_request_id_str) = market_request_id_str {
+                    if let Some(provider_request_id) = provider_request_id {
                         conn.execute(
                             r#"
-                            UPDATE boundless_requests 
+                            UPDATE proof_requests 
                             SET status = ?1, status_code = ?2, updated_at = ?3, proof_data = ?4, error_message = ?5,
-                                market_request_id = ?6
+                                provider_request_id = ?6
                             WHERE request_id = ?7
                             "#,
                             params![
@@ -287,7 +295,7 @@ impl BoundlessStorage {
                                 now,
                                 proof_data,
                                 error_message,
-                                market_request_id_str,
+                                provider_request_id,
                                 request_id
                             ],
                         )
@@ -295,7 +303,7 @@ impl BoundlessStorage {
                     } else {
                         conn.execute(
                             r#"
-                            UPDATE boundless_requests 
+                            UPDATE proof_requests 
                             SET status = ?1, status_code = ?2, updated_at = ?3, proof_data = ?4, error_message = ?5
                             WHERE request_id = ?6
                             "#,
@@ -345,13 +353,15 @@ impl BoundlessStorage {
             .await?
             .call(move |conn| {
                 Self::apply_pragmas(conn)?;
-                let mut stmt = conn.prepare(
-                    r#"
-                    SELECT request_id, market_request_id, status, proof_type, input_data, config_data
-                    FROM boundless_requests 
+                let mut stmt = conn
+                    .prepare(
+                        r#"
+                    SELECT request_id, prover_type, provider_request_id, status, proof_type, input_data, config_data
+                    FROM proof_requests
                     WHERE request_id = ?1
-                    "#
-                ).map_err(|e| e)?;
+                    "#,
+                    )
+                    .map_err(|e| e)?;
 
                 let mut rows = stmt.query_map([request_id], |row| {
                     Self::parse_request_row(row)
@@ -373,49 +383,55 @@ impl BoundlessStorage {
             .await?
             .call(move |conn| {
                 Self::apply_pragmas(conn)?;
-                let mut stmt = conn.prepare(
-                    r#"
-                    SELECT request_id, market_request_id, status, proof_type, input_data, config_data
-                    FROM boundless_requests 
+                let mut stmt = conn
+                    .prepare(
+                        r#"
+                    SELECT request_id, prover_type, provider_request_id, status, proof_type, input_data, config_data
+                    FROM proof_requests
                     WHERE (status_code IS NOT NULL AND status_code NOT IN ('fulfilled','failed'))
                        OR (status_code IS NULL AND status NOT LIKE '%Fulfilled%' AND status NOT LIKE '%Failed%')
                     ORDER BY updated_at DESC
-                    "#
-                ).map_err(|e| e)?;
+                    "#,
+                    )
+                    .map_err(|e| e)?;
 
                 let rows = stmt.query_map([], |row| {
                     // Only parse minimal fields; leave input/config empty to avoid BLOB overhead.
                     let request_id: String = row.get(0)?;
-                    let market_request_id_str: String = row.get(1)?;
-                    let status_json: String = row.get(2)?;
-                    let proof_type_json: String = row.get(3)?;
+                    let prover_type_str: String = row.get(1)?;
+                    let provider_request_id: Option<String> = row.get(2)?;
+                    let status_json: String = row.get(3)?;
+                    let proof_type_json: String = row.get(4)?;
 
-                    let market_request_id = if market_request_id_str.starts_with("0x") {
-                        U256::from_str_radix(&market_request_id_str[2..], 16).map_err(|_| {
-                            rusqlite::Error::InvalidColumnType(
-                                1,
-                                "market_request_id".to_string(),
-                                rusqlite::types::Type::Text,
-                            )
-                        })?
-                    } else {
-                        U256::ZERO
-                    };
-
-                    let status: ProofRequestStatus = serde_json::from_str(&status_json).map_err(|_| {
-                        rusqlite::Error::InvalidColumnType(2, "status".to_string(), rusqlite::types::Type::Text)
-                    })?;
-                    let proof_type: ProofType = serde_json::from_str(&proof_type_json).map_err(|_| {
+                    let prover_type = ProverType::from_str(&prover_type_str).map_err(|_| {
                         rusqlite::Error::InvalidColumnType(
-                            3,
-                            "proof_type".to_string(),
+                            1,
+                            "prover_type".to_string(),
                             rusqlite::types::Type::Text,
                         )
                     })?;
 
+                    let status: ProofRequestStatus =
+                        serde_json::from_str(&status_json).map_err(|_| {
+                            rusqlite::Error::InvalidColumnType(
+                                3,
+                                "status".to_string(),
+                                rusqlite::types::Type::Text,
+                            )
+                        })?;
+                    let proof_type: ProofType =
+                        serde_json::from_str(&proof_type_json).map_err(|_| {
+                            rusqlite::Error::InvalidColumnType(
+                                4,
+                                "proof_type".to_string(),
+                                rusqlite::types::Type::Text,
+                            )
+                        })?;
+
                     Ok(AsyncProofRequest {
                         request_id,
-                        market_request_id,
+                        prover_type,
+                        provider_request_id,
                         status,
                         proof_type,
                         input: Vec::new(), // omitted to reduce I/O
@@ -444,48 +460,54 @@ impl BoundlessStorage {
             .call(move |conn| {
                 Self::apply_pragmas(conn)?;
 
-                let mut stmt = conn.prepare(
-                    r#"
-                    SELECT request_id, market_request_id, status, proof_type, input_data, config_data
-                    FROM boundless_requests 
+                let mut stmt = conn
+                    .prepare(
+                        r#"
+                    SELECT request_id, prover_type, provider_request_id, status, proof_type, input_data, config_data
+                    FROM proof_requests
                     WHERE (status_code IS NOT NULL AND status_code IN ('submitted','locked'))
                        OR (status_code IS NULL AND (status LIKE '%Submitted%' OR status LIKE '%Locked%'))
                     ORDER BY updated_at ASC
-                    "#
-                ).map_err(|e| e)?;
+                    "#,
+                    )
+                    .map_err(|e| e)?;
 
                 let rows = stmt.query_map([], |row| {
                     let request_id: String = row.get(0)?;
-                    let market_request_id_str: String = row.get(1)?;
-                    let status_json: String = row.get(2)?;
-                    let proof_type_json: String = row.get(3)?;
+                    let prover_type_str: String = row.get(1)?;
+                    let provider_request_id: Option<String> = row.get(2)?;
+                    let status_json: String = row.get(3)?;
+                    let proof_type_json: String = row.get(4)?;
 
-                    let market_request_id = if market_request_id_str.starts_with("0x") {
-                        U256::from_str_radix(&market_request_id_str[2..], 16).map_err(|_| {
-                            rusqlite::Error::InvalidColumnType(
-                                1,
-                                "market_request_id".to_string(),
-                                rusqlite::types::Type::Text,
-                            )
-                        })?
-                    } else {
-                        U256::ZERO
-                    };
-
-                    let status: ProofRequestStatus = serde_json::from_str(&status_json).map_err(|_| {
-                        rusqlite::Error::InvalidColumnType(2, "status".to_string(), rusqlite::types::Type::Text)
-                    })?;
-                    let proof_type: ProofType = serde_json::from_str(&proof_type_json).map_err(|_| {
+                    let prover_type = ProverType::from_str(&prover_type_str).map_err(|_| {
                         rusqlite::Error::InvalidColumnType(
-                            3,
-                            "proof_type".to_string(),
+                            1,
+                            "prover_type".to_string(),
                             rusqlite::types::Type::Text,
                         )
                     })?;
 
+                    let status: ProofRequestStatus =
+                        serde_json::from_str(&status_json).map_err(|_| {
+                            rusqlite::Error::InvalidColumnType(
+                                3,
+                                "status".to_string(),
+                                rusqlite::types::Type::Text,
+                            )
+                        })?;
+                    let proof_type: ProofType =
+                        serde_json::from_str(&proof_type_json).map_err(|_| {
+                            rusqlite::Error::InvalidColumnType(
+                                4,
+                                "proof_type".to_string(),
+                                rusqlite::types::Type::Text,
+                            )
+                        })?;
+
                     Ok(AsyncProofRequest {
                         request_id,
-                        market_request_id,
+                        prover_type,
+                        provider_request_id,
                         status,
                         proof_type,
                         input: Vec::new(),               // omitted
@@ -510,43 +532,40 @@ impl BoundlessStorage {
     /// Helper function to parse a database row into AsyncProofRequest
     fn parse_request_row(row: &rusqlite::Row) -> Result<AsyncProofRequest, rusqlite::Error> {
         let request_id: String = row.get(0)?;
-        let market_request_id_str: String = row.get(1)?;
-        let status_json: String = row.get(2)?;
-        let proof_type_json: String = row.get(3)?;
-        let input_data: Vec<u8> = row.get(4)?;
-        let config_json: String = row.get(5)?;
+        let prover_type_str: String = row.get(1)?;
+        let provider_request_id: Option<String> = row.get(2)?;
+        let status_json: String = row.get(3)?;
+        let proof_type_json: String = row.get(4)?;
+        let input_data: Vec<u8> = row.get(5)?;
+        let config_json: String = row.get(6)?;
 
-        // Parse market_request_id from hex string
-        let market_request_id = if market_request_id_str.starts_with("0x") {
-            U256::from_str_radix(&market_request_id_str[2..], 16).map_err(|_| {
-                rusqlite::Error::InvalidColumnType(
-                    1,
-                    "market_request_id".to_string(),
-                    rusqlite::types::Type::Text,
-                )
-            })?
-        } else {
-            U256::ZERO
-        };
+        let prover_type = ProverType::from_str(&prover_type_str).map_err(|_| {
+            rusqlite::Error::InvalidColumnType(
+                1,
+                "prover_type".to_string(),
+                rusqlite::types::Type::Text,
+            )
+        })?;
 
         // Deserialize JSON fields
         let status: ProofRequestStatus = serde_json::from_str(&status_json).map_err(|_| {
-            rusqlite::Error::InvalidColumnType(2, "status".to_string(), rusqlite::types::Type::Text)
+            rusqlite::Error::InvalidColumnType(3, "status".to_string(), rusqlite::types::Type::Text)
         })?;
         let proof_type: ProofType = serde_json::from_str(&proof_type_json).map_err(|_| {
             rusqlite::Error::InvalidColumnType(
-                3,
+                4,
                 "proof_type".to_string(),
                 rusqlite::types::Type::Text,
             )
         })?;
         let config: serde_json::Value = serde_json::from_str(&config_json).map_err(|_| {
-            rusqlite::Error::InvalidColumnType(5, "config".to_string(), rusqlite::types::Type::Text)
+            rusqlite::Error::InvalidColumnType(6, "config".to_string(), rusqlite::types::Type::Text)
         })?;
 
         Ok(AsyncProofRequest {
             request_id,
-            market_request_id,
+            prover_type,
+            provider_request_id,
             status,
             proof_type,
             input: input_data,
@@ -559,9 +578,11 @@ impl BoundlessStorage {
         &self,
         input: &[u8],
         proof_type: &ProofType,
+        prover_type: &ProverType,
     ) -> AgentResult<Option<AsyncProofRequest>> {
         let input_hash = Self::compute_input_hash(input);
         let proof_type_str = Self::proof_type_to_string(proof_type);
+        let prover_type_str = prover_type.as_str().to_string();
 
         self.open_with_pragmas()
             .await?
@@ -569,15 +590,15 @@ impl BoundlessStorage {
                 Self::apply_pragmas(conn)?;
                 let mut stmt = conn.prepare(
                     r#"
-                    SELECT request_id, market_request_id, status, proof_type, input_data, config_data
-                    FROM boundless_requests 
-                    WHERE input_hash = ?1 AND proof_type_str = ?2
+                    SELECT request_id, prover_type, provider_request_id, status, proof_type, input_data, config_data
+                    FROM proof_requests
+                    WHERE input_hash = ?1 AND proof_type_str = ?2 AND prover_type = ?3
                     ORDER BY updated_at DESC
                     LIMIT 1
                     "#
                 ).map_err(|e| e)?;
 
-                let mut rows = stmt.query_map([input_hash, proof_type_str], |row| {
+                let mut rows = stmt.query_map([input_hash, proof_type_str, prover_type_str], |row| {
                     Self::parse_request_row(row)
                 }).map_err(|e| e)?;
 
@@ -602,7 +623,7 @@ impl BoundlessStorage {
                 let mut stmt = conn
                     .prepare(
                         r#"
-                    SELECT request_id FROM boundless_requests 
+                    SELECT request_id FROM proof_requests 
                     WHERE updated_at < (strftime('%s', 'now') - 7200)
                     AND ((status_code IS NOT NULL AND status_code NOT IN ('fulfilled','failed'))
                          OR (status_code IS NULL AND status NOT LIKE '%Fulfilled%'))
@@ -631,7 +652,7 @@ impl BoundlessStorage {
                 let deleted_count = conn
                     .execute(
                         r#"
-                    DELETE FROM boundless_requests 
+                    DELETE FROM proof_requests 
                     WHERE updated_at < (strftime('%s', 'now') - 7200)
                     AND status NOT LIKE '%Fulfilled%'
                     "#,
@@ -665,7 +686,7 @@ impl BoundlessStorage {
                 let mut stmt = conn
                     .prepare(
                         r#"
-                    SELECT request_id FROM boundless_requests
+                    SELECT request_id FROM proof_requests
                     WHERE ttl_expires_at < strftime('%s', 'now')
                     AND (status LIKE '%Fulfilled%' OR status LIKE '%Failed%')
                     "#,
@@ -693,7 +714,7 @@ impl BoundlessStorage {
                 let deleted_count = conn
                     .execute(
                         r#"
-                    DELETE FROM boundless_requests
+                    DELETE FROM proof_requests
                     WHERE ttl_expires_at < strftime('%s', 'now')
                     AND ((status_code IS NOT NULL AND status_code IN ('fulfilled','failed'))
                          OR (status_code IS NULL AND (status LIKE '%Fulfilled%' OR status LIKE '%Failed%')))
@@ -728,7 +749,7 @@ impl BoundlessStorage {
             .call(move |conn| {
                 Self::apply_pragmas(conn)?;
                 let deleted_count = conn
-                    .execute("DELETE FROM boundless_requests", [])
+                    .execute("DELETE FROM proof_requests", [])
                     .map_err(|e| e)?;
 
                 tracing::info!("Deleted {} requests from database", deleted_count);
@@ -753,28 +774,28 @@ impl BoundlessStorage {
                 Self::apply_pragmas(conn)?;
                 // Get total count
                 let total: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM boundless_requests",
+                    "SELECT COUNT(*) FROM proof_requests",
                     [],
                     |row| row.get(0)
                 )?;
 
                 // Get active count
                 let active: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM boundless_requests WHERE (status_code IS NOT NULL AND status_code NOT IN ('fulfilled','failed')) OR (status_code IS NULL AND status NOT LIKE '%Fulfilled%' AND status NOT LIKE '%Failed%')",
+                    "SELECT COUNT(*) FROM proof_requests WHERE (status_code IS NOT NULL AND status_code NOT IN ('fulfilled','failed')) OR (status_code IS NULL AND status NOT LIKE '%Fulfilled%' AND status NOT LIKE '%Failed%')",
                     [],
                     |row| row.get(0)
                 )?;
 
                 // Get completed count
                 let completed: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM boundless_requests WHERE (status_code IS NOT NULL AND status_code = 'fulfilled') OR (status_code IS NULL AND status LIKE '%Fulfilled%')",
+                    "SELECT COUNT(*) FROM proof_requests WHERE (status_code IS NOT NULL AND status_code = 'fulfilled') OR (status_code IS NULL AND status LIKE '%Fulfilled%')",
                     [],
                     |row| row.get(0)
                 )?;
 
                 // Get failed count
                 let failed: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM boundless_requests WHERE (status_code IS NOT NULL AND status_code = 'failed') OR (status_code IS NULL AND status LIKE '%Failed%')",
+                    "SELECT COUNT(*) FROM proof_requests WHERE (status_code IS NOT NULL AND status_code = 'failed') OR (status_code IS NULL AND status LIKE '%Failed%')",
                     [],
                     |row| row.get(0)
                 )?;

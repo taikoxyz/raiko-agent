@@ -1,17 +1,21 @@
 pub mod api;
 pub mod auth;
-pub mod boundless;
+pub mod backends;
 pub mod image_manager;
+pub mod prover_registry;
 pub mod rate_limit;
 pub mod storage;
+pub mod types;
 
-pub use boundless::{
-    AgentError, AgentResult, AsyncProofRequest, BoundlessProver, DeploymentType, ElfType,
-    ProofRequestStatus, ProofType as BoundlessProofType, ProverConfig, generate_request_id,
-};
+pub use backends::boundless::{BoundlessConfig, BoundlessProver, DeploymentType, ProverConfig};
 pub use image_manager::ImageManager;
+pub use prover_registry::ProverRegistry;
 pub use rate_limit::RateLimiter;
-pub use storage::{BoundlessStorage, DatabaseStats};
+pub use storage::{DatabaseStats, RequestStorage};
+pub use types::{
+    AgentError, AgentResult, AsyncProofRequest, ElfType, ProofRequestStatus, ProofType, ProverType,
+    generate_request_id,
+};
 
 use axum::{
     Router,
@@ -19,8 +23,6 @@ use axum::{
     middleware,
     routing::{delete, get, post},
 };
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 use utoipa_scalar::{Scalar, Servable};
 use utoipa_swagger_ui::SwaggerUi;
@@ -32,21 +34,29 @@ use api::{
         image_info_handler, list_async_requests, proof_handler, upload_image_handler,
     },
 };
+use backends::{brevis::BrevisPicoProver, zisk::ZiskProver};
 
 #[derive(Debug, Clone)]
 pub struct AppState {
-    prover: Arc<Mutex<Option<BoundlessProver>>>,
-    rate_limiter: RateLimiter,
-    image_manager: ImageManager,
-    api_key: Option<String>,
+    pub(crate) registry: ProverRegistry,
+    pub(crate) rate_limiter: RateLimiter,
+    pub(crate) image_manager: ImageManager,
+    pub(crate) storage: RequestStorage,
+    pub(crate) api_key: Option<String>,
 }
 
 impl AppState {
-    fn new(api_key: Option<String>) -> Self {
+    fn new(
+        api_key: Option<String>,
+        registry: ProverRegistry,
+        storage: RequestStorage,
+        image_manager: ImageManager,
+    ) -> Self {
         Self {
-            prover: Arc::new(Mutex::new(None)),
+            registry,
             rate_limiter: RateLimiter::from_env(),
-            image_manager: ImageManager::new(),
+            image_manager,
+            storage,
             api_key,
         }
     }
@@ -54,35 +64,14 @@ impl AppState {
     pub(crate) fn api_key(&self) -> Option<&str> {
         self.api_key.as_deref()
     }
-
-    async fn init_prover(&self, config: ProverConfig) -> AgentResult<BoundlessProver> {
-        let prover = BoundlessProver::new(config, self.image_manager.clone())
-            .await
-            .map_err(|e| {
-                AgentError::ClientBuildError(format!("Failed to initialize prover: {}", e))
-            })?;
-        self.prover.lock().await.replace(prover.clone());
-        Ok(prover)
-    }
-
-    /// Get the prover if initialized.
-    async fn get_prover(&self) -> AgentResult<BoundlessProver> {
-        let mut prover_guard = self.prover.lock().await;
-        match prover_guard.as_ref() {
-            Some(prover) => Ok(prover.clone()),
-            None => Err(AgentError::ClientBuildError(
-                "Prover not initialized".to_string(),
-            )),
-        }
-    }
 }
 
 use clap::Parser;
 
-/// Command line arguments for the RISC0 Boundless Agent
+/// Command line arguments for the Raiko Agent
 #[derive(Parser, Debug)]
-#[command(name = "risc0-boundless-agent")]
-#[command(about = "RISC0 Boundless Agent Web Service", long_about = None)]
+#[command(name = "raiko-agent")]
+#[command(about = "Raiko Agent Web Service", long_about = None)]
 struct CmdArgs {
     /// Address to bind the server to (e.g., 0.0.0.0)
     #[arg(long, default_value = "0.0.0.0")]
@@ -127,38 +116,35 @@ struct CmdArgs {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Write logs to stdout so Kubernetes/GCP doesn't treat them as errors
     env_logger::Builder::from_default_env()
         .target(env_logger::Target::Stdout)
         .init();
-    tracing::info!("Starting RISC0 Boundless Agent Web Service...");
+    tracing::info!("Starting Raiko Agent Web Service...");
 
     let args = CmdArgs::parse();
     tracing::info!("Input config: {:?}", args);
 
-    // Configure CORS
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
 
-    // Create app state
-    let state = AppState::new(args.api_key.clone());
+    let image_manager = ImageManager::new();
+    let db_path = std::env::var("SQLITE_DB_PATH")
+        .unwrap_or_else(|_| "./proof_requests.db".to_string());
+    let storage = RequestStorage::new(db_path);
 
-    // Initialize the prover before starting the server
-    tracing::info!("Initializing prover...");
+    tracing::info!("Initializing provers...");
 
-    // Load boundless config from file if provided, otherwise use default
-    let mut boundless_config = boundless::BoundlessConfig::default();
-    if let Some(config_file) = &args.config_file {
-        let config_content = std::fs::read_to_string(config_file)
-            .map_err(|e| format!("Failed to read config file: {}", e))?;
-        let file_config: boundless::BoundlessConfig = serde_json::from_str(&config_content)
-            .map_err(|e| format!("Failed to parse config file: {}", e))?;
-        boundless_config.merge(&file_config);
-    }
+    let config_file = args
+        .config_file
+        .as_ref()
+        .ok_or_else(|| "config-file is required".to_string())?;
+    let config_content = std::fs::read_to_string(config_file)
+        .map_err(|e| format!("Failed to read config file: {}", e))?;
+    let boundless_config: BoundlessConfig = serde_json::from_str(&config_content)
+        .map_err(|e| format!("Failed to parse config file: {}", e))?;
 
-    // Use rpc_url from config file if available, otherwise from args
     let rpc_url = boundless_config.rpc_url.clone().unwrap_or(args.rpc_url);
 
     let prover_config = ProverConfig {
@@ -170,27 +156,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     tracing::info!("Start with prover config: {:?}", prover_config);
 
-    match state.init_prover(prover_config).await {
-        Ok(_) => {
-            tracing::info!("Prover initialized successfully");
-        }
-        Err(e) => {
-            tracing::error!("Failed to initialize prover: {:?}", e);
-            return Err(format!("Failed to initialize prover: {:?}", e).into());
-        }
-    }
+    let boundless = BoundlessProver::new(prover_config, image_manager.clone(), storage.clone())
+        .await
+        .map_err(|e| {
+            AgentError::ClientBuildError(format!("Failed to initialize boundless prover: {}", e))
+        })?;
 
-    // Start background task to clean up rate limiter state
+    let registry = ProverRegistry::new(
+        Some(boundless),
+        Some(ZiskProver::new(image_manager.clone())),
+        Some(BrevisPicoProver::new(image_manager.clone())),
+    );
+
+    let state = AppState::new(args.api_key.clone(), registry, storage, image_manager);
+
     let limiter = state.rate_limiter.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300)); // Cleanup every 5 minutes
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300));
         loop {
             interval.tick().await;
             limiter.cleanup().await;
         }
     });
 
-    // Generate OpenAPI documentation
     let docs = create_docs();
 
     let app = Router::new()
@@ -198,11 +186,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/proof", post(proof_handler))
         .route("/status/:request_id", get(get_async_proof_status))
         .route("/requests", get(list_async_requests))
-        .route("/prune", delete(delete_all_requests))
+        .route("/requests", delete(delete_all_requests))
         .route("/stats", get(get_database_stats))
-        .route("/upload-image/:image_type", post(upload_image_handler))
+        .route("/upload-image/:prover_type/:image_type", post(upload_image_handler))
         .route("/images", get(image_info_handler))
-        // OpenAPI documentation endpoints
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", docs.clone()))
         .merge(Scalar::with_url("/scalar", docs.clone()))
         .route(
@@ -218,11 +205,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state);
 
     let address = format!("{}:{}", args.address, args.port);
-    // Start server
     let listener = tokio::net::TcpListener::bind(&address).await?;
     tracing::info!("Server listening on http://{}", &address);
 
-    // Use into_make_service_with_connect_info to enable ConnectInfo extraction in handlers
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -239,7 +224,6 @@ mod tests {
 
     #[test]
     fn test_deployment_type_parsing() {
-        // Test valid deployment types
         assert_eq!(
             DeploymentType::from_str("sepolia").unwrap(),
             DeploymentType::Sepolia
@@ -250,7 +234,6 @@ mod tests {
             DeploymentType::Base
         );
 
-        // Test case insensitive
         assert_eq!(
             DeploymentType::from_str("SEPOLIA").unwrap(),
             DeploymentType::Sepolia
@@ -261,7 +244,6 @@ mod tests {
             DeploymentType::Base
         );
 
-        // Test invalid deployment type
         assert!(DeploymentType::from_str("invalid").is_err());
         assert!(DeploymentType::from_str("").is_err());
     }

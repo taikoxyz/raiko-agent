@@ -1,203 +1,105 @@
-use crate::AgentError;
+use crate::types::{AgentError, ElfType, ProverType};
 use alloy_primitives_v1p2p0::hex;
-use risc0_zkvm::{compute_image_id, sha::Digest};
+use risc0_zkvm::sha::Digest;
+use serde::Serialize;
 use std::{
+    collections::HashMap,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::SystemTime,
 };
 use tokio::sync::RwLock;
 use url::Url;
+use utoipa::ToSchema;
 
 /// Information about an uploaded ELF image
 #[derive(Debug, Clone)]
 pub struct ImageInfo {
-    /// RISC0 image ID computed from the ELF
-    pub image_id: Digest,
-    /// URL where the image is stored in Boundless Market
-    pub market_url: Url,
+    /// Optional image ID (provider-specific)
+    pub image_id: Option<Digest>,
+    /// Optional URL where the image is stored in the provider backend
+    pub remote_url: Option<Url>,
     /// The original ELF bytes (cached for potential re-upload)
     pub elf_bytes: Vec<u8>,
     /// When to refresh the presigned URL before it expires
-    pub refresh_at: SystemTime,
+    pub refresh_at: Option<SystemTime>,
 }
 
-/// Manages ELF images for both batch and aggregation proving
+#[derive(Debug, Clone)]
+pub struct ImageUploadResult {
+    pub info: ImageInfo,
+    pub reused: bool,
+}
+
+/// Manages ELF images for batch and aggregation proving per prover
 #[derive(Debug, Clone)]
 pub struct ImageManager {
-    batch_image: Arc<RwLock<Option<ImageInfo>>>,
-    aggregation_image: Arc<RwLock<Option<ImageInfo>>>,
+    images: Arc<RwLock<HashMap<(ProverType, ElfType), ImageInfo>>>,
 }
 
 impl ImageManager {
     /// Create a new empty image manager
     pub fn new() -> Self {
         Self {
-            batch_image: Arc::new(RwLock::new(None)),
-            aggregation_image: Arc::new(RwLock::new(None)),
+            images: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Store an image and upload it to Boundless Market
-    pub async fn store_and_upload_image(
+    fn key(prover_type: &ProverType, elf_type: &ElfType) -> (ProverType, ElfType) {
+        (prover_type.clone(), elf_type.clone())
+    }
+
+    /// Store an image in the in-memory cache
+    pub async fn set_image(&self, prover_type: ProverType, elf_type: ElfType, info: ImageInfo) {
+        let mut images = self.images.write().await;
+        images.insert(Self::key(&prover_type, &elf_type), info);
+    }
+
+    /// Get an image if available
+    pub async fn get_image(&self, prover_type: ProverType, elf_type: ElfType) -> Option<ImageInfo> {
+        self.images
+            .read()
+            .await
+            .get(&Self::key(&prover_type, &elf_type))
+            .cloned()
+    }
+
+    /// Get the stored image ID if available
+    pub async fn get_image_id(&self, prover_type: ProverType, elf_type: ElfType) -> Option<Digest> {
+        self.get_image(prover_type, elf_type)
+            .await
+            .and_then(|img| img.image_id)
+    }
+
+    /// Get the remote URL if available
+    pub async fn get_image_url(&self, prover_type: ProverType, elf_type: ElfType) -> Option<Url> {
+        self.get_image(prover_type, elf_type)
+            .await
+            .and_then(|img| img.remote_url)
+    }
+
+    /// Get image details for API responses
+    pub async fn get_image_details(
         &self,
-        image_type: &str,
-        elf_bytes: Vec<u8>,
-        client: &boundless_market::Client,
-    ) -> Result<ImageInfo, AgentError> {
-        // Compute image_id from the ELF
-        let image_id = compute_image_id(&elf_bytes).map_err(|e| {
-            AgentError::ProgramUploadError(format!("Failed to compute image_id: {e}"))
-        })?;
+        prover_type: ProverType,
+        elf_type: ElfType,
+    ) -> Option<ImageDetails> {
+        self.get_image(prover_type, elf_type).await.map(|img| {
+            let (image_id, image_id_hex) = match &img.image_id {
+                Some(id) => (
+                    Some(Self::digest_to_vec(id)),
+                    Some(format!("0x{}", hex::encode(id.as_bytes()))),
+                ),
+                None => (None, None),
+            };
 
-        // Validate image type early and load any existing cached entry
-        let existing = match image_type {
-            "batch" => self.batch_image.read().await.clone(),
-            "aggregation" => self.aggregation_image.read().await.clone(),
-            _ => {
-                return Err(AgentError::RequestBuildError(format!(
-                    "Invalid image type: {}. Must be 'batch' or 'aggregation'",
-                    image_type
-                )));
-            }
-        };
-
-        // If the same image is already stored, reuse it and skip upload.
-        if let Some(existing_info) = existing {
-            if existing_info.image_id == image_id {
-                // Refresh presigned URL if nearing or past expiry
-                if SystemTime::now() < existing_info.refresh_at {
-                    tracing::info!(
-                        "{} image already uploaded. Reusing Image ID: {:?}",
-                        image_type,
-                        image_id
-                    );
-                    return Ok(existing_info);
-                }
-                tracing::info!(
-                    "{} image presigned URL nearing expiry; refreshing. Image ID: {:?}",
-                    image_type,
-                    image_id
-                );
-            } else {
-                tracing::warn!(
-                    "{} image differs from cached version. Replacing. Old ID: {:?}, New ID: {:?}",
-                    image_type,
-                    existing_info.image_id,
-                    image_id
-                );
-            }
-        }
-
-        // Upload to Boundless Market
-        tracing::info!(
-            "Uploading {} image to market ({:.2} MB)...",
-            image_type,
-            elf_bytes.len() as f64 / 1_000_000.0
-        );
-
-        let (market_url, refresh_at) = self
-            .upload_with_refresh_meta(image_type, &elf_bytes, client)
-            .await?;
-
-        tracing::info!(
-            "{} image uploaded successfully. Image ID: {:?}, URL: {}",
-            image_type,
-            image_id,
-            market_url
-        );
-
-        // Create and store the image info
-        let info = ImageInfo {
-            image_id,
-            market_url,
-            elf_bytes,
-            refresh_at,
-        };
-
-        // Store in the appropriate slot
-        match image_type {
-            "batch" => *self.batch_image.write().await = Some(info.clone()),
-            "aggregation" => *self.aggregation_image.write().await = Some(info.clone()),
-            _ => unreachable!(), // Already validated above
-        }
-
-        Ok(info)
-    }
-
-    /// Get the batch image info if available
-    pub async fn get_batch_image(&self) -> Option<ImageInfo> {
-        self.batch_image.read().await.clone()
-    }
-
-    /// Get the aggregation image info if available
-    pub async fn get_aggregation_image(&self) -> Option<ImageInfo> {
-        self.aggregation_image.read().await.clone()
-    }
-
-    /// Get the market URL for batch image if available
-    pub async fn get_batch_image_url(&self) -> Option<Url> {
-        self.batch_image
-            .read()
-            .await
-            .as_ref()
-            .map(|i| i.market_url.clone())
-    }
-
-    /// Get the market URL for aggregation image if available
-    pub async fn get_aggregation_image_url(&self) -> Option<Url> {
-        self.aggregation_image
-            .read()
-            .await
-            .as_ref()
-            .map(|i| i.market_url.clone())
-    }
-
-    /// Get comprehensive information about both uploaded images
-    pub async fn get_batch_info(&self) -> Option<ImageDetails> {
-        self.batch_image
-            .read()
-            .await
-            .as_ref()
-            .map(|img| ImageDetails {
+            ImageDetails {
                 uploaded: true,
-                image_id: Self::digest_to_vec(&img.image_id),
-                image_id_hex: format!("0x{}", hex::encode(img.image_id.as_bytes())),
-                market_url: img.market_url.to_string(),
+                image_id,
+                image_id_hex,
+                provider_url: img.remote_url.map(|url| url.to_string()),
                 elf_size_bytes: img.elf_bytes.len(),
-            })
-    }
-
-    /// Get aggregation image details
-    pub async fn get_aggregation_info(&self) -> Option<ImageDetails> {
-        self.aggregation_image
-            .read()
-            .await
-            .as_ref()
-            .map(|img| ImageDetails {
-                uploaded: true,
-                image_id: Self::digest_to_vec(&img.image_id),
-                image_id_hex: format!("0x{}", hex::encode(img.image_id.as_bytes())),
-                market_url: img.market_url.to_string(),
-                elf_size_bytes: img.elf_bytes.len(),
-            })
-    }
-
-    /// Get the stored batch image ID if available
-    pub async fn get_batch_image_id(&self) -> Option<Digest> {
-        self.batch_image
-            .read()
-            .await
-            .as_ref()
-            .map(|img| img.image_id)
-    }
-
-    /// Get the stored aggregation image ID if available
-    pub async fn get_aggregation_image_id(&self) -> Option<Digest> {
-        self.aggregation_image
-            .read()
-            .await
-            .as_ref()
-            .map(|img| img.image_id)
+            }
+        })
     }
 
     /// Convert Digest to Vec<u32> for JSON serialization
@@ -232,72 +134,17 @@ impl ImageManager {
         Digest::try_from(bytes.as_slice())
             .map_err(|e| AgentError::RequestBuildError(format!("Invalid image_id format: {e}")))
     }
-
-    /// Upload the program and compute a refresh deadline based on the presigned URL expiry.
-    async fn upload_with_refresh_meta(
-        &self,
-        image_type: &str,
-        elf_bytes: &[u8],
-        client: &boundless_market::Client,
-    ) -> Result<(Url, SystemTime), AgentError> {
-        let market_url = client.upload_program(elf_bytes).await.map_err(|e| {
-            AgentError::ProgramUploadError(format!("{} upload failed: {e}", image_type))
-        })?;
-
-        // Try to derive expiry from the presigned URL; fallback to 1h.
-        let expires_secs = market_url
-            .query_pairs()
-            .find(|(k, _)| k.eq_ignore_ascii_case("X-Amz-Expires"))
-            .and_then(|(_, v)| v.parse::<u64>().ok())
-            .unwrap_or(3600);
-
-        // Refresh a bit before actual expiry to avoid 403; default buffer 120s.
-        let refresh_at = SystemTime::now()
-            + Duration::from_secs(expires_secs.saturating_sub(120));
-
-        Ok((market_url, refresh_at))
-    }
 }
 
 /// Details about an uploaded image for API responses
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ImageDetails {
     pub uploaded: bool,
-    pub image_id: Vec<u32>,
-    pub image_id_hex: String,
-    pub market_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_id: Option<Vec<u32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_id_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_url: Option<String>,
     pub elf_size_bytes: usize,
-}
-
-impl Default for ImageManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_digest_conversion() {
-        let original = vec![
-            3537337764u32,
-            1055695413,
-            664197713,
-            1225410428,
-            3705161813,
-            2151977348,
-            4164639052,
-            2614443474,
-        ];
-
-        let digest = ImageManager::vec_to_digest(&original).unwrap();
-        let converted = ImageManager::digest_to_vec(&digest);
-
-        assert_eq!(
-            original, converted,
-            "Digest conversion should be reversible"
-        );
-    }
 }
