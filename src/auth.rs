@@ -16,6 +16,8 @@ fn is_exempt_path(path: &str) -> bool {
         || path.starts_with("/api-docs/")
         || path.starts_with("/docs")
         || path.starts_with("/scalar")
+        || path.starts_with("/artifacts/")
+        || path.starts_with("/inputs/")
 }
 
 fn unauthorized_response() -> Response {

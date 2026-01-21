@@ -2,6 +2,7 @@ use axum::{
     Json,
     extract::{ConnectInfo, Path, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
 };
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -19,6 +20,36 @@ use crate::{
         generate_request_id,
     },
 };
+
+fn parse_artifact_name(value: &str) -> Option<ElfType> {
+    let value = value.trim();
+    let value = value.strip_suffix(".elf").unwrap_or(value);
+    match value {
+        "batch" => Some(ElfType::Batch),
+        "aggregation" => Some(ElfType::Aggregation),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod artifact_parsing_tests {
+    use super::*;
+
+    #[test]
+    fn parse_artifact_name_accepts_expected_variants() {
+        assert_eq!(super::parse_artifact_name("batch.elf"), Some(ElfType::Batch));
+        assert_eq!(
+            super::parse_artifact_name("aggregation.elf"),
+            Some(ElfType::Aggregation)
+        );
+        assert_eq!(super::parse_artifact_name("batch"), Some(ElfType::Batch));
+        assert_eq!(
+            super::parse_artifact_name("aggregation"),
+            Some(ElfType::Aggregation)
+        );
+        assert_eq!(super::parse_artifact_name("unknown"), None);
+    }
+}
 
 /// Convert internal ProofRequestStatus to user-friendly API response
 fn map_status_to_api_response(request: &AsyncProofRequest) -> DetailedStatusResponse {
@@ -604,6 +635,130 @@ pub async fn upload_image_handler(
         status: status.to_string(),
         message: format!("{} image processed successfully", image_type),
     }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/artifacts/{prover_type}/{name}",
+    tag = "Artifacts",
+    params(
+        ("prover_type" = String, Path, description = "Prover type: 'brevis'"),
+        ("name" = String, Path, description = "Artifact name: 'batch.elf' or 'aggregation.elf'")
+    ),
+    responses(
+        (status = 200, description = "Artifact bytes", content_type = "application/octet-stream"),
+        (status = 404, description = "Artifact not found", body = ErrorResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse)
+    )
+)]
+pub async fn get_artifact_handler(
+    State(state): State<AppState>,
+    Path((prover_type, name)): Path<(String, String)>,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let prover_type = match ProverType::from_str(&prover_type) {
+        Ok(prover_type) => prover_type,
+        Err(message) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "InvalidProverType".to_string(),
+                    message,
+                }),
+            ));
+        }
+    };
+
+    let elf_type = parse_artifact_name(&name).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "InvalidArtifactName".to_string(),
+                message: format!(
+                    "Invalid artifact name '{}'. Expected 'batch.elf' or 'aggregation.elf'",
+                    name
+                ),
+            }),
+        )
+    })?;
+
+    let image = state.image_manager.get_image(prover_type, elf_type).await;
+    let Some(image) = image else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "ArtifactNotFound".to_string(),
+                message: "Artifact not found".to_string(),
+            }),
+        ));
+    };
+
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        image.elf_bytes,
+    )
+        .into_response())
+}
+
+#[utoipa::path(
+    get,
+    path = "/inputs/{request_id}",
+    tag = "Artifacts",
+    params(
+        ("request_id" = String, Path, description = "Raiko-agent request identifier")
+    ),
+    responses(
+        (status = 200, description = "Input bytes", content_type = "application/octet-stream"),
+        (status = 404, description = "Input not found", body = ErrorResponse)
+    )
+)]
+pub async fn get_input_handler(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let request = match state.storage.get_request(&request_id).await {
+        Ok(Some(request)) => request,
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "RequestNotFound".to_string(),
+                    message: "No proof request found with the specified request_id".to_string(),
+                }),
+            ));
+        }
+        Err(_e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "DatabaseError".to_string(),
+                    message: "Failed to retrieve request input".to_string(),
+                }),
+            ));
+        }
+    };
+
+    // Keep this endpoint scoped to Brevis requests to avoid leaking other provers' payloads.
+    if request.prover_type != ProverType::Brevis {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "RequestNotFound".to_string(),
+                message: "No proof request found with the specified request_id".to_string(),
+            }),
+        ));
+    }
+
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        request.input,
+    )
+        .into_response())
 }
 
 #[utoipa::path(

@@ -30,11 +30,12 @@ use utoipa_swagger_ui::SwaggerUi;
 use api::{
     create_docs,
     handlers::{
-        delete_all_requests, get_async_proof_status, get_database_stats, health_check,
-        image_info_handler, list_async_requests, proof_handler, upload_image_handler,
+        delete_all_requests, get_artifact_handler, get_async_proof_status, get_database_stats,
+        get_input_handler, health_check, image_info_handler, list_async_requests, proof_handler,
+        upload_image_handler,
     },
 };
-use backends::{brevis::BrevisProver, zisk::ZiskProver};
+use backends::{brevis::{BrevisProver, BrevisProverNetConfig}, zisk::ZiskProver};
 
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -109,6 +110,10 @@ struct CmdArgs {
     #[arg(long)]
     config_file: Option<String>,
 
+    /// Path to Brevis ProverNet config file (JSON format)
+    #[arg(long)]
+    brevis_config_file: Option<String>,
+
     /// Optional API key required for all non-health requests
     #[arg(long, env = "BOUNDLESS_API_KEY")]
     api_key: Option<String>,
@@ -150,6 +155,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Initializing provers...");
 
+    let brevis_provernet_config = match args.brevis_config_file.as_ref() {
+        Some(path) => {
+            let raw = std::fs::read_to_string(path)
+                .map_err(|e| format!("Failed to read Brevis config file: {}", e))?;
+            let cfg: BrevisProverNetConfig = serde_json::from_str(&raw)
+                .map_err(|e| format!("Failed to parse Brevis config file: {}", e))?;
+            Some(cfg)
+        }
+        None => None,
+    };
+
     let boundless = if let Some(config_file) = args.config_file.as_ref() {
         let config_content = std::fs::read_to_string(config_file)
             .map_err(|e| format!("Failed to read config file: {}", e))?;
@@ -182,17 +198,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let brevis = if cfg!(feature = "brevis") {
+        match brevis_provernet_config {
+            Some(cfg) => Some(BrevisProver::new(
+                image_manager.clone(),
+                storage.clone(),
+                Some(cfg),
+            )),
+            None => {
+                tracing::info!("Brevis ProverNet config not provided; brevis prover disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let registry = ProverRegistry::new(
         boundless,
         Some(ZiskProver::new(image_manager.clone(), storage.clone())),
-        if cfg!(feature = "brevis") {
-            Some(BrevisProver::new(
-                image_manager.clone(),
-                storage.clone(),
-            ))
-        } else {
-            None
-        },
+        brevis,
     );
 
     let state = AppState::new(args.api_key.clone(), registry, storage, image_manager);
@@ -217,6 +242,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/stats", get(get_database_stats))
         .route("/upload-image/:prover_type/:image_type", post(upload_image_handler))
         .route("/images", get(image_info_handler))
+        .route(
+            "/artifacts/:prover_type/:name",
+            get(get_artifact_handler),
+        )
+        .route("/inputs/:request_id", get(get_input_handler))
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", docs.clone()))
         .merge(Scalar::with_url("/scalar", docs.clone()))
         .route(

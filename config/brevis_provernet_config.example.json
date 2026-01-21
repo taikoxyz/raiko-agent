@@ -1,0 +1,15 @@
+{
+  "rpc_url": "https://base-rpc.publicnode.com",
+  "chain_id": 8453,
+  "brevis_market_address": "0x0000000000000000000000000000000000000000",
+  "market_viewer_address": "0x0000000000000000000000000000000000000000",
+  "signer_private_key": "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "fee_policy": {
+    "max_fee_wei": "0",
+    "min_stake_wei": "0",
+    "deadline_secs": 3600
+  },
+  "artifact_base_url": "https://your-raiko-agent.example.com",
+  "input_inline_max_bytes": 4096,
+  "poll_interval_secs": 10
+}
