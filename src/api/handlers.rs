@@ -663,3 +663,66 @@ pub async fn image_info_handler(
 
     Ok(Json(ImageInfoResponse { provers }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_request(status: ProofRequestStatus) -> AsyncProofRequest {
+        AsyncProofRequest {
+            request_id: "req_1".to_string(),
+            prover_type: ProverType::Boundless,
+            provider_request_id: Some("provider_fallback".to_string()),
+            status,
+            proof_type: ProofType::Batch,
+            input: vec![1],
+            config: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn test_map_status_preparing_uses_fallback_provider_id() {
+        let req = base_request(ProofRequestStatus::Preparing);
+        let resp = map_status_to_api_response(&req);
+        assert_eq!(resp.status, "preparing");
+        assert_eq!(resp.provider_request_id.as_deref(), Some("provider_fallback"));
+        assert!(resp.proof_data.is_none());
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn test_map_status_submitted_overrides_provider_id() {
+        let req = base_request(ProofRequestStatus::Submitted {
+            provider_request_id: "provider_status".to_string(),
+            expires_at: Some(123),
+        });
+        let resp = map_status_to_api_response(&req);
+        assert_eq!(resp.status, "submitted");
+        assert_eq!(resp.provider_request_id.as_deref(), Some("provider_status"));
+    }
+
+    #[test]
+    fn test_map_status_fulfilled_includes_proof() {
+        let req = base_request(ProofRequestStatus::Fulfilled {
+            provider_request_id: "provider_status".to_string(),
+            proof: vec![9, 9, 9],
+        });
+        let resp = map_status_to_api_response(&req);
+        assert_eq!(resp.status, "completed");
+        assert_eq!(resp.provider_request_id.as_deref(), Some("provider_status"));
+        assert_eq!(resp.proof_data.as_deref(), Some(&[9, 9, 9][..]));
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn test_map_status_failed_includes_error() {
+        let req = base_request(ProofRequestStatus::Failed {
+            error: "oops".to_string(),
+        });
+        let resp = map_status_to_api_response(&req);
+        assert_eq!(resp.status, "failed");
+        assert!(resp.proof_data.is_none());
+        assert_eq!(resp.error.as_deref(), Some("oops"));
+        assert!(resp.status_message.contains("oops"));
+    }
+}

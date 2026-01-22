@@ -41,6 +41,8 @@ log = "0.4.27"
 ethers-contract = "2.0.10"
 ethers = "2.0.10"
 ethers-core = "2.0.10"
+tower = "0.5"
+tempfile = "3"
 
 # Additional test dependencies
 

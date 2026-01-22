@@ -107,3 +107,53 @@ impl ProverRegistry {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_supported_provers_only_includes_configured() {
+        let image_manager = crate::ImageManager::new();
+        let registry = ProverRegistry::new(
+            None,
+            Some(ZiskProver::new(image_manager.clone())),
+            Some(BrevisPicoProver::new(image_manager)),
+        );
+
+        assert_eq!(
+            registry.supported_provers(),
+            vec![ProverType::Zisk, ProverType::BrevisPico]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_submit_proof_returns_unavailable_when_missing() {
+        let registry = ProverRegistry::new(None, None, None);
+        let err = registry
+            .submit_proof(
+                ProverType::Boundless,
+                "req".to_string(),
+                ProofType::Batch,
+                vec![1],
+                vec![2],
+                serde_json::Value::Null,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AgentError::ProverUnavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn test_upload_image_returns_unavailable_when_missing() {
+        let registry = ProverRegistry::new(None, None, None);
+        let err = registry
+            .upload_image(ProverType::BrevisPico, ElfType::Batch, vec![1, 2, 3])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AgentError::ProverUnavailable(_)));
+    }
+}

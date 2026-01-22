@@ -626,7 +626,7 @@ impl RequestStorage {
                     SELECT request_id FROM proof_requests 
                     WHERE updated_at < (strftime('%s', 'now') - 7200)
                     AND ((status_code IS NOT NULL AND status_code NOT IN ('fulfilled','failed'))
-                         OR (status_code IS NULL AND status NOT LIKE '%Fulfilled%'))
+                         OR (status_code IS NULL AND status NOT LIKE '%Fulfilled%' AND status NOT LIKE '%Failed%'))
                     "#,
                     )
                     .map_err(|e| e)?;
@@ -654,7 +654,8 @@ impl RequestStorage {
                         r#"
                     DELETE FROM proof_requests 
                     WHERE updated_at < (strftime('%s', 'now') - 7200)
-                    AND status NOT LIKE '%Fulfilled%'
+                    AND ((status_code IS NOT NULL AND status_code NOT IN ('fulfilled','failed'))
+                         OR (status_code IS NULL AND status NOT LIKE '%Fulfilled%' AND status NOT LIKE '%Failed%'))
                     "#,
                         [],
                     )
@@ -833,4 +834,374 @@ pub struct DatabaseStats {
     pub active_requests: u64,
     pub completed_requests: u64,
     pub failed_requests: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::params;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn request(
+        request_id: &str,
+        prover_type: ProverType,
+        status: ProofRequestStatus,
+        proof_type: ProofType,
+        input: Vec<u8>,
+    ) -> AsyncProofRequest {
+        AsyncProofRequest {
+            request_id: request_id.to_string(),
+            prover_type,
+            provider_request_id: None,
+            status,
+            proof_type,
+            input,
+            config: serde_json::json!({"k":"v"}),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_store_and_get_by_input_hash_roundtrip() {
+        let storage = RequestStorage::new(":memory:".to_string());
+        storage.initialize().await.unwrap();
+
+        let input = vec![1, 2, 3, 4];
+        let proof_type = ProofType::Batch;
+        let prover_type = ProverType::Boundless;
+        let req = request(
+            "req_roundtrip",
+            prover_type.clone(),
+            ProofRequestStatus::Preparing,
+            proof_type.clone(),
+            input.clone(),
+        );
+        storage.store_request(&req).await.unwrap();
+
+        let loaded = storage
+            .get_request_by_input_hash(&input, &proof_type, &prover_type)
+            .await
+            .unwrap()
+            .expect("request should be found by input hash");
+
+        assert_eq!(loaded.request_id, req.request_id);
+        assert_eq!(loaded.prover_type, req.prover_type);
+        assert!(matches!(loaded.status, ProofRequestStatus::Preparing));
+        assert!(matches!(loaded.proof_type, ProofType::Batch));
+        assert_eq!(loaded.input, input);
+        assert_eq!(loaded.config, req.config);
+    }
+
+    #[tokio::test]
+    async fn test_delete_expired_requests_does_not_delete_failed_when_status_code_present() {
+        let storage = RequestStorage::new(":memory:".to_string());
+        storage.initialize().await.unwrap();
+
+        let pending = request(
+            "req_pending_old",
+            ProverType::Boundless,
+            ProofRequestStatus::Submitted {
+                provider_request_id: "prov_1".to_string(),
+                expires_at: None,
+            },
+            ProofType::Batch,
+            vec![0xAA],
+        );
+        let failed = request(
+            "req_failed_old",
+            ProverType::Boundless,
+            ProofRequestStatus::Failed {
+                error: "boom".to_string(),
+            },
+            ProofType::Batch,
+            vec![0xBB],
+        );
+
+        storage.store_request(&pending).await.unwrap();
+        storage.store_request(&failed).await.unwrap();
+
+        let old_updated_at = (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64)
+            - 7201;
+
+        let conn = storage.open_with_pragmas().await.unwrap();
+        conn.call(move |conn| {
+            conn.execute(
+                "UPDATE proof_requests SET updated_at = ?1 WHERE request_id = ?2",
+                params![old_updated_at, pending.request_id],
+            )?;
+            conn.execute(
+                "UPDATE proof_requests SET updated_at = ?1 WHERE request_id = ?2",
+                params![old_updated_at, failed.request_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let deleted_ids = storage.delete_expired_requests().await.unwrap();
+        assert_eq!(deleted_ids, vec!["req_pending_old".to_string()]);
+
+        assert!(
+            storage
+                .get_request("req_pending_old")
+                .await
+                .unwrap()
+                .is_none(),
+            "pending request should be deleted"
+        );
+        assert!(
+            storage
+                .get_request("req_failed_old")
+                .await
+                .unwrap()
+                .is_some(),
+            "failed request should not be deleted by delete_expired_requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_status_persists_provider_request_id_and_proof() {
+        let storage = RequestStorage::new(":memory:".to_string());
+        storage.initialize().await.unwrap();
+
+        let req = request(
+            "req_update",
+            ProverType::Boundless,
+            ProofRequestStatus::Preparing,
+            ProofType::Batch,
+            vec![1, 2, 3],
+        );
+        storage.store_request(&req).await.unwrap();
+
+        let submitted = ProofRequestStatus::Submitted {
+            provider_request_id: "prov_123".to_string(),
+            expires_at: Some(42),
+        };
+        storage.update_status(&req.request_id, &submitted).await.unwrap();
+
+        let loaded = storage
+            .get_request(&req.request_id)
+            .await
+            .unwrap()
+            .expect("request should exist");
+        assert_eq!(loaded.provider_request_id.as_deref(), Some("prov_123"));
+        assert!(matches!(loaded.status, ProofRequestStatus::Submitted { .. }));
+
+        let fulfilled = ProofRequestStatus::Fulfilled {
+            provider_request_id: "prov_123".to_string(),
+            proof: vec![9, 9],
+        };
+        storage.update_status(&req.request_id, &fulfilled).await.unwrap();
+
+        let loaded = storage
+            .get_request(&req.request_id)
+            .await
+            .unwrap()
+            .expect("request should exist");
+
+        match loaded.status {
+            ProofRequestStatus::Fulfilled {
+                provider_request_id,
+                proof,
+            } => {
+                assert_eq!(provider_request_id, "prov_123");
+                assert_eq!(proof, vec![9, 9]);
+            }
+            other => panic!("unexpected status: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_pending_requests_includes_submitted_and_locked() {
+        let storage = RequestStorage::new(":memory:".to_string());
+        storage.initialize().await.unwrap();
+
+        let base = request(
+            "req_pending_base",
+            ProverType::Boundless,
+            ProofRequestStatus::Preparing,
+            ProofType::Batch,
+            vec![0x01],
+        );
+        storage.store_request(&base).await.unwrap();
+
+        let locked = request(
+            "req_pending_locked",
+            ProverType::Boundless,
+            ProofRequestStatus::Preparing,
+            ProofType::Batch,
+            vec![0x02],
+        );
+        storage.store_request(&locked).await.unwrap();
+
+        storage
+            .update_status(
+                &base.request_id,
+                &ProofRequestStatus::Submitted {
+                    provider_request_id: "prov_sub".to_string(),
+                    expires_at: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        storage
+            .update_status(
+                &locked.request_id,
+                &ProofRequestStatus::Locked {
+                    provider_request_id: "prov_lock".to_string(),
+                    prover: Some("boundless".to_string()),
+                    expires_at: Some(123),
+                },
+            )
+            .await
+            .unwrap();
+
+        let pending = storage.get_pending_requests().await.unwrap();
+        assert_eq!(pending.len(), 2);
+
+        let mut provider_ids: Vec<Option<String>> =
+            pending.into_iter().map(|r| r.provider_request_id).collect();
+        provider_ids.sort();
+        assert_eq!(
+            provider_ids,
+            vec![Some("prov_lock".to_string()), Some("prov_sub".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_expired_ttl_requests_removes_completed_past_ttl() {
+        let storage = RequestStorage::new(":memory:".to_string());
+        storage.initialize().await.unwrap();
+
+        let fulfilled = request(
+            "req_ttl_fulfilled",
+            ProverType::Boundless,
+            ProofRequestStatus::Fulfilled {
+                provider_request_id: "prov".to_string(),
+                proof: vec![1],
+            },
+            ProofType::Batch,
+            vec![0xFF],
+        );
+        let failed = request(
+            "req_ttl_failed",
+            ProverType::Boundless,
+            ProofRequestStatus::Failed {
+                error: "nope".to_string(),
+            },
+            ProofType::Batch,
+            vec![0xEE],
+        );
+
+        storage.store_request(&fulfilled).await.unwrap();
+        storage.store_request(&failed).await.unwrap();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let past_ttl = now - 1;
+
+        let conn = storage.open_with_pragmas().await.unwrap();
+        conn.call(move |conn| {
+            conn.execute(
+                "UPDATE proof_requests SET ttl_expires_at = ?1 WHERE request_id = ?2",
+                params![past_ttl, fulfilled.request_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let deleted = storage.delete_expired_ttl_requests().await.unwrap();
+        assert_eq!(deleted, vec!["req_ttl_fulfilled".to_string()]);
+        assert!(storage
+            .get_request("req_ttl_fulfilled")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(storage
+            .get_request("req_ttl_failed")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_stats_counts_statuses() {
+        let storage = RequestStorage::new(":memory:".to_string());
+        storage.initialize().await.unwrap();
+
+        storage
+            .store_request(&request(
+                "req_stats_active",
+                ProverType::Boundless,
+                ProofRequestStatus::Preparing,
+                ProofType::Batch,
+                vec![1],
+            ))
+            .await
+            .unwrap();
+        storage
+            .store_request(&request(
+                "req_stats_done",
+                ProverType::Boundless,
+                ProofRequestStatus::Fulfilled {
+                    provider_request_id: "prov".to_string(),
+                    proof: vec![1, 2],
+                },
+                ProofType::Batch,
+                vec![2],
+            ))
+            .await
+            .unwrap();
+        storage
+            .store_request(&request(
+                "req_stats_failed",
+                ProverType::Boundless,
+                ProofRequestStatus::Failed {
+                    error: "no".to_string(),
+                },
+                ProofType::Batch,
+                vec![3],
+            ))
+            .await
+            .unwrap();
+
+        let stats = storage.get_stats().await.unwrap();
+        assert_eq!(stats.total_requests, 3);
+        assert_eq!(stats.active_requests, 1);
+        assert_eq!(stats.completed_requests, 1);
+        assert_eq!(stats.failed_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn test_file_backed_storage_persists_between_instances() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = file.path().to_string_lossy().to_string();
+
+        let storage = RequestStorage::new(db_path.clone());
+        storage.initialize().await.unwrap();
+
+        let req = request(
+            "req_file",
+            ProverType::Boundless,
+            ProofRequestStatus::Preparing,
+            ProofType::Batch,
+            vec![1, 2, 3],
+        );
+        storage.store_request(&req).await.unwrap();
+
+        let storage2 = RequestStorage::new(db_path);
+        storage2.initialize().await.unwrap();
+        let loaded = storage2
+            .get_request("req_file")
+            .await
+            .unwrap()
+            .expect("request should persist in file-backed db");
+        assert_eq!(loaded.request_id, "req_file");
+    }
 }

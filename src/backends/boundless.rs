@@ -2139,4 +2139,56 @@ mod tests {
         // 0.0001 * 1000 = 0.1 USDC
         assert_eq!(lock_collateral, U256::from(100000000000000000u64));
     }
+
+    #[ignore = "slow: local RISC0 execution (requires tests/elf/boundless-batch.bin)"]
+    #[test]
+    fn test_local_execute_batch_fixture_8081() {
+        let elf_path =
+            std::env::var("BOUNDLESS_BATCH_ELF").unwrap_or_else(|_| "tests/elf/boundless-batch.bin".to_string());
+        let elf_bytes = std::fs::read(&elf_path)
+            .unwrap_or_else(|e| panic!("Failed to read batch ELF at {}: {}", elf_path, e));
+
+        let input_bytes =
+            std::fs::read("tests/fixtures/batch-input-8081.bin").expect("missing input fixture");
+        let expected_journal =
+            std::fs::read("tests/fixtures/batch-journal-8081.bin").expect("missing output fixture");
+
+        let guest_env = GuestEnv::builder().write_frame(&input_bytes).build_env();
+        let session_info = default_executor()
+            .execute(guest_env.try_into().unwrap(), &elf_bytes)
+            .expect("guest execution failed");
+
+        assert_eq!(
+            session_info.journal.bytes, expected_journal,
+            "journal mismatch (got {} bytes, expected {} bytes)",
+            session_info.journal.bytes.len(),
+            expected_journal.len()
+        );
+    }
+
+    #[ignore = "very slow: local RISC0 execution (requires tests/elf/boundless-batch.bin and large fixture)"]
+    #[test]
+    fn test_local_execute_batch_fixture_15840() {
+        let elf_path =
+            std::env::var("BOUNDLESS_BATCH_ELF").unwrap_or_else(|_| "tests/elf/boundless-batch.bin".to_string());
+        let elf_bytes = std::fs::read(&elf_path)
+            .unwrap_or_else(|e| panic!("Failed to read batch ELF at {}: {}", elf_path, e));
+
+        let input_bytes =
+            std::fs::read("tests/fixtures/batch-input-15840.bin").expect("missing input fixture");
+        let expected_journal =
+            std::fs::read("tests/fixtures/batch-journal-15840.bin").expect("missing output fixture");
+
+        let guest_env = GuestEnv::builder().write_frame(&input_bytes).build_env();
+        let session_info = default_executor()
+            .execute(guest_env.try_into().unwrap(), &elf_bytes)
+            .expect("guest execution failed");
+
+        assert_eq!(
+            session_info.journal.bytes, expected_journal,
+            "journal mismatch (got {} bytes, expected {} bytes)",
+            session_info.journal.bytes.len(),
+            expected_journal.len()
+        );
+    }
 }

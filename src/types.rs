@@ -143,3 +143,54 @@ pub fn generate_request_id(input: &[u8], proof_type: &ProofType, prover_type: &P
     };
     format!("{}_{}_{}", hex::encode(input_hash), prover_type.as_str(), proof_type_str)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_prover_type_from_str_and_display() {
+        assert_eq!(ProverType::from_str("boundless").unwrap(), ProverType::Boundless);
+        assert_eq!(ProverType::from_str("zisk").unwrap(), ProverType::Zisk);
+        assert_eq!(ProverType::from_str("brevis_pico").unwrap(), ProverType::BrevisPico);
+
+        assert_eq!(ProverType::from_str("Brevis").unwrap(), ProverType::BrevisPico);
+        assert_eq!(ProverType::from_str("PICO").unwrap(), ProverType::BrevisPico);
+
+        assert_eq!(ProverType::Boundless.to_string(), "boundless");
+        assert_eq!(ProverType::Zisk.to_string(), "zisk");
+        assert_eq!(ProverType::BrevisPico.to_string(), "brevis_pico");
+
+        let err = ProverType::from_str("nope").unwrap_err();
+        assert!(err.contains("Invalid prover type"));
+    }
+
+    #[test]
+    fn test_generate_request_id_is_stable_and_varies_by_inputs() {
+        let input = b"hello";
+        let prover = ProverType::Boundless;
+
+        let batch = generate_request_id(input, &ProofType::Batch, &prover);
+        let batch_again = generate_request_id(input, &ProofType::Batch, &prover);
+        assert_eq!(batch, batch_again);
+
+        let aggregate = generate_request_id(input, &ProofType::Aggregate, &prover);
+        assert_ne!(batch, aggregate);
+
+        let other_input = generate_request_id(b"world", &ProofType::Batch, &prover);
+        assert_ne!(batch, other_input);
+
+        let other_prover = generate_request_id(input, &ProofType::Batch, &ProverType::Zisk);
+        assert_ne!(batch, other_prover);
+
+        let update = generate_request_id(input, &ProofType::Update(ElfType::Batch), &prover);
+        assert_ne!(batch, update);
+
+        let parts: Vec<&str> = batch.split('_').collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].len(), 64);
+        assert_eq!(parts[1], "boundless");
+        assert_eq!(parts[2], "batch");
+    }
+}

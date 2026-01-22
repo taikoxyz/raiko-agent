@@ -148,3 +148,67 @@ pub struct ImageDetails {
     pub provider_url: Option<String>,
     pub elf_size_bytes: usize,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use risc0_zkvm::sha::Digest;
+
+    #[test]
+    fn test_digest_vec_roundtrip() {
+        let bytes: Vec<u8> = (0u8..32u8).collect();
+        let digest = Digest::try_from(bytes.as_slice()).unwrap();
+
+        let vec = ImageManager::digest_to_vec(&digest);
+        assert_eq!(vec.len(), 8);
+
+        let rebuilt = ImageManager::vec_to_digest(&vec).unwrap();
+        assert_eq!(rebuilt, digest);
+
+        let arr = ImageManager::digest_to_array(&digest);
+        assert_eq!(arr.as_slice(), vec.as_slice());
+    }
+
+    #[test]
+    fn test_vec_to_digest_rejects_wrong_length() {
+        let err = ImageManager::vec_to_digest(&[1u32, 2, 3]).unwrap_err();
+        assert!(matches!(err, AgentError::RequestBuildError(_)));
+    }
+
+    #[tokio::test]
+    async fn test_get_image_details_includes_hex_and_sizes() {
+        let manager = ImageManager::new();
+
+        let bytes: Vec<u8> = (0u8..32u8).collect();
+        let digest = Digest::try_from(bytes.as_slice()).unwrap();
+        let url = Url::parse("https://example.com/program").unwrap();
+
+        manager
+            .set_image(
+                ProverType::Boundless,
+                ElfType::Batch,
+                ImageInfo {
+                    image_id: Some(digest),
+                    remote_url: Some(url.clone()),
+                    elf_bytes: vec![1, 2, 3, 4, 5],
+                    refresh_at: None,
+                },
+            )
+            .await;
+
+        let details = manager
+            .get_image_details(ProverType::Boundless, ElfType::Batch)
+            .await
+            .unwrap();
+
+        assert!(details.uploaded);
+        assert_eq!(details.elf_size_bytes, 5);
+        assert_eq!(details.provider_url.as_deref(), Some(url.as_str()));
+        assert_eq!(details.image_id.as_ref().unwrap().len(), 8);
+        assert!(details
+            .image_id_hex
+            .as_ref()
+            .unwrap()
+            .starts_with("0x"));
+    }
+}
