@@ -665,7 +665,7 @@ impl RequestStorage {
                     r#"
                     DELETE FROM proof_requests 
                     WHERE updated_at < (strftime('%s', 'now') - 7200)
-                    AND ((status_code IS NOT NULL AND status_code NOT IN ('fulfilled'))
+                    AND ((status_code IS NOT NULL AND status_code NOT IN ('fulfilled','failed'))
                          OR (status_code IS NULL AND status NOT LIKE '%Fulfilled%'))
                     "#,
                     [],
@@ -857,17 +857,12 @@ mod tests {
         format!("/tmp/raiko-agent-test-{}.db", nanos)
     }
 
-    #[tokio::test]
-    async fn delete_expired_requests_includes_failed_in_deleted_ids() {
-        let db_path = temp_db_path();
-        let storage = RequestStorage::new(db_path.clone());
-        storage.initialize().await.unwrap();
-
-        let conn = tokio_rusqlite::Connection::open(db_path.clone())
-            .await
-            .unwrap();
-
-        let request_id = "req_failed_old".to_string();
+    async fn insert_failed_request(
+        conn: &tokio_rusqlite::Connection,
+        request_id: String,
+        updated_at: i64,
+        ttl_expires_at: i64,
+    ) {
         let status = ProofRequestStatus::Failed {
             error: "oops".to_string(),
         };
@@ -875,13 +870,7 @@ mod tests {
         let proof_type = ProofType::Batch;
         let proof_type_json = serde_json::to_string(&proof_type).unwrap();
         let config_json = serde_json::to_string(&serde_json::Value::Null).unwrap();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        let updated_at = now - 7201;
 
-        let request_id_for_insert = request_id.clone();
         conn.call(move |conn| {
             conn.execute(
                 r#"
@@ -891,7 +880,7 @@ mod tests {
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                 "#,
                 params![
-                    request_id_for_insert,
+                    request_id,
                     ProverType::Boundless.as_str(),
                     Option::<String>::None,
                     status_json,
@@ -904,33 +893,67 @@ mod tests {
                     Option::<String>::None,
                     Option::<String>::None,
                     "batch",
-                    Option::<i64>::None
+                    ttl_expires_at
                 ],
             )?;
             Ok(())
         })
         .await
         .unwrap();
+    }
 
-        let deleted = storage.delete_expired_requests().await.unwrap();
-        assert!(
-            deleted.contains(&request_id),
-            "Expected failed request to be reported as deleted"
-        );
+    async fn count_request(
+        conn: &tokio_rusqlite::Connection,
+        request_id: String,
+    ) -> i64 {
+        conn.call(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM proof_requests WHERE request_id = ?1",
+                [request_id],
+                |row| row.get(0),
+            )
+            .map_err(tokio_rusqlite::Error::from)
+        })
+        .await
+        .unwrap()
+    }
 
-        let request_id_for_count = request_id.clone();
-        let remaining: i64 = conn
-            .call(move |conn| {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM proof_requests WHERE request_id = ?1",
-                    [request_id_for_count],
-                    |row| row.get(0),
-                )
-                .map_err(tokio_rusqlite::Error::from)
-            })
+    #[tokio::test]
+    async fn failed_requests_cleanup_via_ttl_only() {
+        let db_path = temp_db_path();
+        let storage = RequestStorage::new(db_path.clone());
+        storage.initialize().await.unwrap();
+
+        let conn = tokio_rusqlite::Connection::open(db_path.clone())
             .await
             .unwrap();
 
-        assert_eq!(remaining, 0);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let updated_at = now - 7201;
+        let ttl_expires_at = now - 1;
+        let request_id = "req_failed_old".to_string();
+
+        insert_failed_request(&conn, request_id.clone(), updated_at, ttl_expires_at).await;
+
+        let deleted = storage.delete_expired_requests().await.unwrap();
+        assert!(
+            !deleted.contains(&request_id),
+            "Failed requests should not be deleted by non-terminal cleanup"
+        );
+
+        let remaining_after_nonterminal = count_request(&conn, request_id.clone()).await;
+        assert_eq!(remaining_after_nonterminal, 1);
+
+        let deleted_ttl = storage.delete_expired_ttl_requests().await.unwrap();
+        assert!(
+            deleted_ttl.contains(&request_id),
+            "Failed requests should be deleted by TTL cleanup"
+        );
+
+        let remaining_after_ttl = count_request(&conn, request_id).await;
+        assert_eq!(remaining_after_ttl, 0);
     }
 }
