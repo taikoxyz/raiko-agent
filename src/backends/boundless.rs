@@ -1628,7 +1628,11 @@ impl BoundlessProver {
         *handle_guard = Some(cleanup_task);
     }
 
-    async fn evaluate_cost(&self, guest_env: &GuestEnv, elf: &[u8]) -> AgentResult<(u64, Vec<u8>)> {
+    async fn _evaluate_cost(
+        &self,
+        guest_env: &GuestEnv,
+        elf: &[u8],
+    ) -> AgentResult<(u64, Vec<u8>)> {
         let (mcycles_count, _journal) = {
             // Dry run the ELF with the input to get the journal and cycle count.
             // This can be useful to estimate the cost of the proving request.
