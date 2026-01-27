@@ -902,10 +902,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn count_request(
-        conn: &tokio_rusqlite::Connection,
-        request_id: String,
-    ) -> i64 {
+    async fn count_request(conn: &tokio_rusqlite::Connection, request_id: String) -> i64 {
         conn.call(move |conn| {
             conn.query_row(
                 "SELECT COUNT(*) FROM proof_requests WHERE request_id = ?1",
