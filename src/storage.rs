@@ -640,7 +640,7 @@ impl RequestStorage {
                     r#"
                     SELECT request_id FROM proof_requests 
                     WHERE updated_at < (strftime('%s', 'now') - 7200)
-                    AND ((status_code IS NOT NULL AND status_code NOT IN ('fulfilled'))
+                    AND ((status_code IS NOT NULL AND status_code NOT IN ('fulfilled','failed'))
                          OR (status_code IS NULL AND status NOT LIKE '%Fulfilled%'))
                     "#,
                 )?;
