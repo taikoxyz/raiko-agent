@@ -241,7 +241,8 @@ impl BoundlessProver {
         let deployment = Some(self.deployment.clone());
         let storage_provider = boundless_market::storage::storage_provider_from_env().ok();
 
-        let url = Url::parse(&self.config.rpc_url).unwrap();
+        let url = Url::parse(&self.config.rpc_url)
+            .map_err(|e| AgentError::ClientBuildError(e.to_string()))?;
         let signer: PrivateKeySigner = self.config.signer_key.parse().unwrap();
 
         let client = Client::builder()
