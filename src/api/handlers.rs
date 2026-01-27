@@ -194,7 +194,7 @@ pub async fn proof_handler(
         prover_type
     );
 
-    let config = config.unwrap_or_else(|| serde_json::Value::default());
+    let config = config.unwrap_or_else(serde_json::Value::default);
 
     let result = state
         .registry
@@ -362,10 +362,8 @@ pub async fn list_async_requests(
         }
     };
 
-    let detailed_requests: Vec<DetailedStatusResponse> = requests
-        .iter()
-        .map(|req| map_status_to_api_response(req))
-        .collect();
+    let detailed_requests: Vec<DetailedStatusResponse> =
+        requests.iter().map(map_status_to_api_response).collect();
 
     Ok(Json(RequestListResponse {
         active_requests: requests.len(),

@@ -36,6 +36,7 @@ impl ProverRegistry {
         provers
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn submit_proof(
         &self,
         prover_type: ProverType,

@@ -132,6 +132,12 @@ impl ImageManager {
     }
 }
 
+impl Default for ImageManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Details about an uploaded image for API responses
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ImageDetails {

@@ -179,15 +179,13 @@ impl BoundlessConfig {
         };
 
         // Apply deployment overrides if provided
-        if let Some(deployment_config) = &self.deployment {
-            if let Some(overrides) = &deployment_config.overrides {
-                if let Some(order_stream_url) =
-                    overrides.get("order_stream_url").and_then(|v| v.as_str())
-                {
-                    deployment.order_stream_url =
-                        Some(std::borrow::Cow::Owned(order_stream_url.to_string()));
-                }
-            }
+        if let Some(deployment_config) = &self.deployment
+            && let Some(overrides) = &deployment_config.overrides
+            && let Some(order_stream_url) =
+                overrides.get("order_stream_url").and_then(|v| v.as_str())
+        {
+            deployment.order_stream_url =
+                Some(std::borrow::Cow::Owned(order_stream_url.to_string()));
         }
 
         deployment
@@ -675,18 +673,18 @@ impl BoundlessProver {
             .await
         {
             if existing_info.image_id == Some(image_id) {
-                if let Some(refresh_at) = existing_info.refresh_at {
-                    if SystemTime::now() < refresh_at {
-                        tracing::info!(
-                            "{} image already uploaded. Reusing image ID: {:?}",
-                            image_label,
-                            image_id
-                        );
-                        return Ok(ImageUploadResult {
-                            info: existing_info,
-                            reused: true,
-                        });
-                    }
+                if let Some(refresh_at) = existing_info.refresh_at
+                    && SystemTime::now() < refresh_at
+                {
+                    tracing::info!(
+                        "{} image already uploaded. Reusing image ID: {:?}",
+                        image_label,
+                        image_id
+                    );
+                    return Ok(ImageUploadResult {
+                        info: existing_info,
+                        reused: true,
+                    });
                 }
 
                 tracing::info!(
@@ -1094,6 +1092,7 @@ impl BoundlessProver {
     }
 
     /// Helper method to process input, build request, and submit to market
+    #[allow(clippy::too_many_arguments)]
     async fn process_and_submit_request(
         &self,
         request_id: &str,
@@ -1664,6 +1663,7 @@ impl BoundlessProver {
         Ok((mcycles_count, _journal))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn build_boundless_request(
         &self,
         boundless_client: &Client,
@@ -1694,8 +1694,8 @@ impl BoundlessProver {
         // })? * U256::from(mcycles_count);
 
         let lock_collateral = parse_staking_token(&offer_spec.lock_collateral)?;
-        let lock_timeout = (offer_spec.lock_timeout_ms_per_mcycle * mcycles_count / 1000u32) as u32;
-        let timeout = (offer_spec.timeout_ms_per_mcycle * mcycles_count / 1000u32) as u32;
+        let lock_timeout = offer_spec.lock_timeout_ms_per_mcycle * mcycles_count / 1000u32;
+        let timeout = offer_spec.timeout_ms_per_mcycle * mcycles_count / 1000u32;
         let ramp_up_period = std::cmp::min(offer_spec.ramp_up_sec, lock_timeout);
 
         let mut request_params = boundless_client
@@ -1915,7 +1915,7 @@ mod tests {
     #[test]
     fn test_deserialize_zkvm_receipt() {
         // let file_name = format!("tests/fixtures/boundless_receipt_test.json");
-        let file_name = format!("tests/fixtures/proof-1306738.bin");
+        let file_name = "tests/fixtures/proof-1306738.bin".to_string();
         let bincode_proof: Vec<u8> = std::fs::read(file_name).unwrap();
         let proof: Risc0Response = bincode::deserialize(&bincode_proof).unwrap();
         println!("Deserialized proof: {:#?}", proof);
@@ -1953,7 +1953,7 @@ mod tests {
         env_logger::try_init().ok();
 
         // Load and deserialize existing proof fixture
-        let file_name = format!("tests/fixtures/proof-1306738.bin");
+        let file_name = "tests/fixtures/proof-1306738.bin".to_string();
         let proof_bytes: Vec<u8> = std::fs::read(file_name).unwrap();
         let proof: Risc0Response = bincode::deserialize(&proof_bytes).unwrap();
         println!("Deserialized proof: {:#?}", proof);
@@ -2029,12 +2029,12 @@ mod tests {
 
         if verify_call_res.is_ok() {
             tracing_info!("SNARK verified successfully using {groth16_verifier_addr:?}!");
-            return true;
+            true
         } else {
             tracing_err!(
                 "SNARK verification call to {groth16_verifier_addr:?} failed: {verify_call_res:?}!"
             );
-            return false;
+            false
         }
     }
 
@@ -2043,7 +2043,7 @@ mod tests {
         env_logger::try_init().ok();
 
         // Load a proof file and deserialize to Risc0Response
-        let file_name = format!("tests/fixtures/proof-1306738.bin");
+        let file_name = "tests/fixtures/proof-1306738.bin".to_string();
         let proof_bytes: Vec<u8> = std::fs::read(file_name).expect("Failed to read proof file");
         let proof: Risc0Response =
             bincode::deserialize(&proof_bytes).expect("Failed to deserialize proof");

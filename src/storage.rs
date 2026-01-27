@@ -103,13 +103,13 @@ impl RequestStorage {
                     )
                     "#,
                     [],
-                ).map_err(|e| e)?;
+                )?;
 
                 // Create index for faster status queries
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_status ON proof_requests(status)",
                     [],
-                ).map_err(|e| e)?;
+                )?;
 
                 // Migrate existing database by adding new columns if they don't exist
                 let _ = conn.execute("ALTER TABLE proof_requests ADD COLUMN input_hash TEXT", []);
@@ -121,19 +121,19 @@ impl RequestStorage {
                 conn.execute(
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_input_dedup ON proof_requests(input_hash, proof_type_str, prover_type) WHERE input_hash IS NOT NULL AND proof_type_str IS NOT NULL",
                     [],
-                ).map_err(|e| e)?;
+                )?;
 
                 // Index for status_code based filtering
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_status_code ON proof_requests(status_code)",
                     [],
-                ).map_err(|e| e)?;
+                )?;
 
                 // Create index for TTL-based cleanup
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_ttl_expires_at ON proof_requests(ttl_expires_at)",
                     [],
-                ).map_err(|e| e)?;
+                )?;
 
                 Ok(())
             })
@@ -221,7 +221,7 @@ impl RequestStorage {
                             proof_type_str,
                             ttl_expires_at
                         ],
-                    ).map_err(|e| e)?;
+                    )?;
 
                     Ok(())
                 })
@@ -312,7 +312,7 @@ impl RequestStorage {
                                 request_id
                             ],
                         )
-                        .map_err(|e| e)?;
+                        ?;
                     } else {
                         conn.execute(
                             r#"
@@ -329,7 +329,7 @@ impl RequestStorage {
                                 request_id
                             ],
                         )
-                        .map_err(|e| e)?;
+                        ?;
                     }
 
                     Ok(())
@@ -377,11 +377,11 @@ impl RequestStorage {
                     WHERE request_id = ?1
                     "#,
                     )
-                    .map_err(|e| e)?;
+                    ?;
 
                 let mut rows = stmt.query_map([request_id], |row| {
                     Self::parse_request_row(row)
-                }).map_err(|e| e)?;
+                })?;
 
                 match rows.next() {
                     Some(Ok(request)) => Ok(Some(request)),
@@ -409,7 +409,7 @@ impl RequestStorage {
                     ORDER BY updated_at DESC
                     "#,
                     )
-                    .map_err(|e| e)?;
+                    ?;
 
                 let rows = stmt.query_map([], |row| {
                     // Only parse minimal fields; leave input/config empty to avoid BLOB overhead.
@@ -453,7 +453,7 @@ impl RequestStorage {
                         input: Vec::new(), // omitted to reduce I/O
                         config: serde_json::Value::Null, // omitted
                     })
-                }).map_err(|e| e)?;
+                })?;
 
                 let mut requests = Vec::new();
                 for row in rows {
@@ -486,7 +486,7 @@ impl RequestStorage {
                     ORDER BY updated_at ASC
                     "#,
                     )
-                    .map_err(|e| e)?;
+                    ?;
 
                 let rows = stmt.query_map([], |row| {
                     let request_id: String = row.get(0)?;
@@ -529,7 +529,7 @@ impl RequestStorage {
                         input: Vec::new(),               // omitted
                         config: serde_json::Value::Null, // omitted
                     })
-                }).map_err(|e| e)?;
+                })?;
 
                 let mut requests = Vec::new();
                 for row in rows {
@@ -612,11 +612,11 @@ impl RequestStorage {
                     ORDER BY updated_at DESC
                     LIMIT 1
                     "#
-                ).map_err(|e| e)?;
+                )?;
 
                 let mut rows = stmt.query_map([input_hash, proof_type_str, prover_type_str], |row| {
                     Self::parse_request_row(row)
-                }).map_err(|e| e)?;
+                })?;
 
                 match rows.next() {
                     Some(Ok(request)) => Ok(Some(request)),
@@ -636,23 +636,19 @@ impl RequestStorage {
             .call(move |conn| {
                 Self::apply_pragmas(conn)?;
                 // First, get the request IDs that will be deleted
-                let mut stmt = conn
-                    .prepare(
-                        r#"
+                let mut stmt = conn.prepare(
+                    r#"
                     SELECT request_id FROM proof_requests 
                     WHERE updated_at < (strftime('%s', 'now') - 7200)
                     AND ((status_code IS NOT NULL AND status_code NOT IN ('fulfilled'))
                          OR (status_code IS NULL AND status NOT LIKE '%Fulfilled%'))
                     "#,
-                    )
-                    .map_err(|e| e)?;
+                )?;
 
-                let rows = stmt
-                    .query_map([], |row| {
-                        let request_id: String = row.get(0)?;
-                        Ok(request_id)
-                    })
-                    .map_err(|e| e)?;
+                let rows = stmt.query_map([], |row| {
+                    let request_id: String = row.get(0)?;
+                    Ok(request_id)
+                })?;
 
                 let mut deleted_ids = Vec::new();
                 for row in rows {
@@ -665,17 +661,15 @@ impl RequestStorage {
                 }
 
                 // Now delete the expired requests
-                let deleted_count = conn
-                    .execute(
-                        r#"
+                let deleted_count = conn.execute(
+                    r#"
                     DELETE FROM proof_requests 
                     WHERE updated_at < (strftime('%s', 'now') - 7200)
                     AND ((status_code IS NOT NULL AND status_code NOT IN ('fulfilled'))
                          OR (status_code IS NULL AND status NOT LIKE '%Fulfilled%'))
                     "#,
-                        [],
-                    )
-                    .map_err(|e| e)?;
+                    [],
+                )?;
 
                 if deleted_count > 0 {
                     tracing::info!(
@@ -708,14 +702,14 @@ impl RequestStorage {
                     AND (status LIKE '%Fulfilled%' OR status LIKE '%Failed%')
                     "#,
                     )
-                    .map_err(|e| e)?;
+                    ?;
 
                 let rows = stmt
                     .query_map([], |row| {
                         let request_id: String = row.get(0)?;
                         Ok(request_id)
                     })
-                    .map_err(|e| e)?;
+                    ?;
 
                 let mut deleted_ids = Vec::new();
                 for row in rows {
@@ -738,7 +732,7 @@ impl RequestStorage {
                     "#,
                         [],
                     )
-                    .map_err(|e| e)?;
+                    ?;
 
                 if deleted_count > 0 {
                     tracing::info!(
@@ -765,9 +759,7 @@ impl RequestStorage {
             .await?
             .call(move |conn| {
                 Self::apply_pragmas(conn)?;
-                let deleted_count = conn
-                    .execute("DELETE FROM proof_requests", [])
-                    .map_err(|e| e)?;
+                let deleted_count = conn.execute("DELETE FROM proof_requests", [])?;
 
                 tracing::info!("Deleted {} requests from database", deleted_count);
                 Ok(deleted_count)
