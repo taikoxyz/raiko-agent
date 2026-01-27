@@ -1796,8 +1796,8 @@ fn validate_offer_params(
     let ramp_up_seconds = ramp_up_period.saturating_mul(block_time_sec);
     if ramp_up_seconds > lock_timeout {
         return Err(AgentError::RequestBuildError(format!(
-            "ramp_up_period_blocks ({}) exceeds lock_timeout ({})",
-            ramp_up_period, lock_timeout
+            "ramp_up_period_seconds ({}) (ramp_up_period_blocks: {}, block_time_sec: {}) exceeds lock_timeout_seconds ({})",
+            ramp_up_seconds, ramp_up_period, block_time_sec, lock_timeout
         )));
     }
 
