@@ -7,22 +7,22 @@
     },
     "offer_params": {
         "batch": {
-            "ramp_up_start_sec": 30,
-            "ramp_up_period_blocks": 15,
-            "lock_timeout_ms_per_mcycle": 90,
-            "timeout_ms_per_mcycle": 215,
+            "ramp_up_start_sec": 2,
+            "ramp_up_period_blocks": 60,
+            "lock_timeout_ms_per_mcycle": 150,
+            "timeout_ms_per_mcycle": 310,
             "max_price_per_mcycle": "0.000000085",
             "min_price_per_mcycle": "0.000000005",
-            "lock_collateral": "15"
+            "lock_collateral": "20"
         },
         "aggregation": {
-            "ramp_up_start_sec": 30,
-            "ramp_up_period_blocks": 15,
+            "ramp_up_start_sec": 2,
+            "ramp_up_period_blocks": 60,
             "lock_timeout_ms_per_mcycle": 1500,
-            "timeout_ms_per_mcycle": 4500,
+            "timeout_ms_per_mcycle": 3000,
             "max_price_per_mcycle": "0.00000006",
             "min_price_per_mcycle": "0.000000006",
-            "lock_collateral": "15"
+            "lock_collateral": "20"
         }
     },
     "rpc_url": "https://base-rpc.publicnode.com"
