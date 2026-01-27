@@ -7,7 +7,8 @@
     },
     "offer_params": {
         "batch": {
-            "ramp_up_sec": 2400,
+            "ramp_up_start_sec": 30,
+            "ramp_up_period_blocks": 15,
             "lock_timeout_ms_per_mcycle": 2000,
             "timeout_ms_per_mcycle": 4000,
             "max_price_per_mcycle": "0.00000002",
@@ -15,7 +16,8 @@
             "lock_collateral": "5"
         },
         "aggregation": {
-            "ramp_up_sec": 1800,
+            "ramp_up_start_sec": 30,
+            "ramp_up_period_blocks": 15,
             "lock_timeout_ms_per_mcycle": 2000,
             "timeout_ms_per_mcycle": 3000,
             "max_price_per_mcycle": "0.00000001",

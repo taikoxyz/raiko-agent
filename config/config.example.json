@@ -7,20 +7,22 @@
     },
     "offer_params": {
         "batch": {
-            "ramp_up_sec": 1200,
-            "lock_timeout_sec": 6000,
-            "timeout_sec": 10800,
+            "ramp_up_start_sec": 30,
+            "ramp_up_period_blocks": 15,
+            "lock_timeout_ms_per_mcycle": 90,
+            "timeout_ms_per_mcycle": 215,
             "max_price_per_mcycle": "0.00003",
             "min_price_per_mcycle": "0.000003",
-            "lock_collateral_per_mcycle": "0.0001"
+            "lock_collateral": "0.0001"
         },
         "aggregation": {
-            "ramp_up_sec": 300,
-            "lock_timeout_sec": 2400,
-            "timeout_sec": 4500,
+            "ramp_up_start_sec": 30,
+            "ramp_up_period_blocks": 15,
+            "lock_timeout_ms_per_mcycle": 1500,
+            "timeout_ms_per_mcycle": 4500,
             "max_price_per_mcycle": "0.00001",
             "min_price_per_mcycle": "0.000001",
-            "lock_collateral_per_mcycle": "0.0001"
+            "lock_collateral": "0.0001"
         }
     }
 }
