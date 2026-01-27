@@ -110,9 +110,9 @@ are required.
 ### Offer Params Guidance
 
 - `ramp_up_start_sec`: delay (seconds) after request creation before bidding starts.
-- `ramp_up_period_blocks`: ramp-up duration in **blocks** (Base uses ~2s/block). Must be <= `lock_timeout`.
-- `lock_timeout_ms_per_mcycle`: computed total seconds = `ms_per_mcycle * mcycles / 1000`. Primary prover must fulfill by this time.
-- `timeout_ms_per_mcycle`: total seconds until request expiry. Must be > `lock_timeout_ms_per_mcycle`.
+- `ramp_up_period_blocks`: ramp-up duration in **blocks** (Base uses ~2s/block). Ensure `ramp_up_period_blocks * block_time_sec <= (lock_timeout_ms_per_mcycle * mcycles / 1000)` so ramp-up finishes before the lock timeout elapses.
+- `lock_timeout_ms_per_mcycle`: lock timeout in **milliseconds per million cycles**; total lock timeout in seconds is `lock_timeout_ms_per_mcycle * mcycles / 1000`. The primary prover must fulfill by this time.
+- `timeout_ms_per_mcycle`: request expiry in **milliseconds per million cycles**; total expiry time in seconds is `timeout_ms_per_mcycle * mcycles / 1000`. This total expiry must be greater than the total lock timeout (i.e., use `timeout_ms_per_mcycle` > `lock_timeout_ms_per_mcycle` for the same workload).
 - `max_price_per_mcycle` / `min_price_per_mcycle`: per‑mcycle price bounds; min defaults to 0 if omitted.
 - `lock_collateral`: fixed ZKC amount (explicitly configured; not derived from price).
 
