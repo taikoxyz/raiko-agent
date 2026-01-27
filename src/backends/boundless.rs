@@ -171,6 +171,7 @@ impl BoundlessConfig {
     }
 
     /// Get the effective deployment configuration by merging with base deployment
+    #[allow(clippy::collapsible_if)]
     pub fn get_effective_deployment(&self) -> Deployment {
         let deployment_type = self.get_deployment_type();
         let mut deployment = match deployment_type {
@@ -179,13 +180,15 @@ impl BoundlessConfig {
         };
 
         // Apply deployment overrides if provided
-        if let Some(deployment_config) = &self.deployment
-            && let Some(overrides) = &deployment_config.overrides
-            && let Some(order_stream_url) =
-                overrides.get("order_stream_url").and_then(|v| v.as_str())
-        {
-            deployment.order_stream_url =
-                Some(std::borrow::Cow::Owned(order_stream_url.to_string()));
+        if let Some(deployment_config) = &self.deployment {
+            if let Some(overrides) = &deployment_config.overrides {
+                if let Some(order_stream_url) =
+                    overrides.get("order_stream_url").and_then(|v| v.as_str())
+                {
+                    deployment.order_stream_url =
+                        Some(std::borrow::Cow::Owned(order_stream_url.to_string()));
+                }
+            }
         }
 
         deployment
@@ -653,6 +656,7 @@ impl BoundlessProver {
         Ok(prover)
     }
 
+    #[allow(clippy::collapsible_if)]
     pub async fn upload_image(
         &self,
         elf_type: ElfType,
@@ -673,18 +677,18 @@ impl BoundlessProver {
             .await
         {
             if existing_info.image_id == Some(image_id) {
-                if let Some(refresh_at) = existing_info.refresh_at
-                    && SystemTime::now() < refresh_at
-                {
-                    tracing::info!(
-                        "{} image already uploaded. Reusing image ID: {:?}",
-                        image_label,
-                        image_id
-                    );
-                    return Ok(ImageUploadResult {
-                        info: existing_info,
-                        reused: true,
-                    });
+                if let Some(refresh_at) = existing_info.refresh_at {
+                    if SystemTime::now() < refresh_at {
+                        tracing::info!(
+                            "{} image already uploaded. Reusing image ID: {:?}",
+                            image_label,
+                            image_id
+                        );
+                        return Ok(ImageUploadResult {
+                            info: existing_info,
+                            reused: true,
+                        });
+                    }
                 }
 
                 tracing::info!(
