@@ -1,4 +1,4 @@
-use crate::backends::{brevis::BrevisPicoProver, boundless::BoundlessProver, zisk::ZiskProver};
+use crate::backends::{boundless::BoundlessProver, brevis::BrevisPicoProver, zisk::ZiskProver};
 use crate::image_manager::ImageUploadResult;
 use crate::types::{AgentError, AgentResult, ElfType, ProofType, ProverType};
 
@@ -49,9 +49,7 @@ impl ProverRegistry {
         match prover_type {
             ProverType::Boundless => match self.boundless.as_ref() {
                 Some(prover) => match proof_type {
-                    ProofType::Batch => {
-                        prover.batch_run(request_id, input, output, &config).await
-                    }
+                    ProofType::Batch => prover.batch_run(request_id, input, output, &config).await,
                     ProofType::Aggregate => {
                         prover.aggregate(request_id, input, output, &config).await
                     }

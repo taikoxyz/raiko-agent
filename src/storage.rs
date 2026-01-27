@@ -52,14 +52,24 @@ impl RequestStorage {
                 let db_path = self.db_path.clone();
                 let conn = tokio_rusqlite::Connection::open(db_path)
                     .await
-                    .map_err(|e| AgentError::ClientBuildError(format!("Failed to open SQLite database: {}", e)))?;
+                    .map_err(|e| {
+                        AgentError::ClientBuildError(format!(
+                            "Failed to open SQLite database: {}",
+                            e
+                        ))
+                    })?;
 
                 conn.call(|conn| {
                     Self::apply_pragmas(conn)?;
                     Ok(())
                 })
                 .await
-                .map_err(|e| AgentError::ClientBuildError(format!("Failed to configure SQLite pragmas: {}", e)))?;
+                .map_err(|e| {
+                    AgentError::ClientBuildError(format!(
+                        "Failed to configure SQLite pragmas: {}",
+                        e
+                    ))
+                })?;
 
                 Ok(conn)
             })
@@ -221,14 +231,17 @@ impl RequestStorage {
                 Ok(_) => return Ok(()),
                 Err(e) if Self::is_locked_error(&e) && attempt < 2 => {
                     last_err = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt + 1) as u64)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        200 * (attempt + 1) as u64,
+                    ))
+                    .await;
                     continue;
                 }
                 Err(e) => {
                     return Err(AgentError::ClientBuildError(format!(
                         "Failed to store request: {}",
                         e
-                    )))
+                    )));
                 }
             }
         }
@@ -327,14 +340,17 @@ impl RequestStorage {
                 Ok(_) => return Ok(()),
                 Err(e) if Self::is_locked_error(&e) && attempt < 2 => {
                     last_err = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt + 1) as u64)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        200 * (attempt + 1) as u64,
+                    ))
+                    .await;
                     continue;
                 }
                 Err(e) => {
                     return Err(AgentError::ClientBuildError(format!(
                         "Failed to update status: {}",
                         e
-                    )))
+                    )));
                 }
             }
         }
@@ -625,7 +641,7 @@ impl RequestStorage {
                         r#"
                     SELECT request_id FROM proof_requests 
                     WHERE updated_at < (strftime('%s', 'now') - 7200)
-                    AND ((status_code IS NOT NULL AND status_code NOT IN ('fulfilled','failed'))
+                    AND ((status_code IS NOT NULL AND status_code NOT IN ('fulfilled'))
                          OR (status_code IS NULL AND status NOT LIKE '%Fulfilled%'))
                     "#,
                     )
@@ -654,7 +670,8 @@ impl RequestStorage {
                         r#"
                     DELETE FROM proof_requests 
                     WHERE updated_at < (strftime('%s', 'now') - 7200)
-                    AND status NOT LIKE '%Fulfilled%'
+                    AND ((status_code IS NOT NULL AND status_code NOT IN ('fulfilled'))
+                         OR (status_code IS NULL AND status NOT LIKE '%Fulfilled%'))
                     "#,
                         [],
                     )
@@ -833,4 +850,95 @@ pub struct DatabaseStats {
     pub active_requests: u64,
     pub completed_requests: u64,
     pub failed_requests: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_db_path() -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("/tmp/raiko-agent-test-{}.db", nanos)
+    }
+
+    #[tokio::test]
+    async fn delete_expired_requests_includes_failed_in_deleted_ids() {
+        let db_path = temp_db_path();
+        let storage = RequestStorage::new(db_path.clone());
+        storage.initialize().await.unwrap();
+
+        let conn = tokio_rusqlite::Connection::open(db_path.clone())
+            .await
+            .unwrap();
+
+        let request_id = "req_failed_old".to_string();
+        let status = ProofRequestStatus::Failed {
+            error: "oops".to_string(),
+        };
+        let status_json = serde_json::to_string(&status).unwrap();
+        let proof_type = ProofType::Batch;
+        let proof_type_json = serde_json::to_string(&proof_type).unwrap();
+        let config_json = serde_json::to_string(&serde_json::Value::Null).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let updated_at = now - 7201;
+
+        let request_id_for_insert = request_id.clone();
+        conn.call(move |conn| {
+            conn.execute(
+                r#"
+                INSERT INTO proof_requests
+                (request_id, prover_type, provider_request_id, status, status_code, proof_type, input_data, config_data,
+                 updated_at, proof_data, error_message, input_hash, proof_type_str, ttl_expires_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                "#,
+                params![
+                    request_id_for_insert,
+                    ProverType::Boundless.as_str(),
+                    Option::<String>::None,
+                    status_json,
+                    "failed",
+                    proof_type_json,
+                    Vec::<u8>::new(),
+                    config_json,
+                    updated_at,
+                    Option::<Vec<u8>>::None,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    "batch",
+                    Option::<i64>::None
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let deleted = storage.delete_expired_requests().await.unwrap();
+        assert!(
+            deleted.contains(&request_id),
+            "Expected failed request to be reported as deleted"
+        );
+
+        let request_id_for_count = request_id.clone();
+        let remaining: i64 = conn
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM proof_requests WHERE request_id = ?1",
+                    [request_id_for_count],
+                    |row| row.get(0),
+                )
+                .map_err(tokio_rusqlite::Error::from)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(remaining, 0);
+    }
 }

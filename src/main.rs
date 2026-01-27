@@ -67,9 +67,10 @@ impl AppState {
 }
 
 use clap::Parser;
+use std::fmt;
 
 /// Command line arguments for the Raiko Agent
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(name = "raiko-agent")]
 #[command(about = "Raiko Agent Web Service", long_about = None)]
 struct CmdArgs {
@@ -114,6 +115,25 @@ struct CmdArgs {
     api_key: Option<String>,
 }
 
+impl fmt::Debug for CmdArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CmdArgs")
+            .field("address", &self.address)
+            .field("port", &self.port)
+            .field("offchain", &self.offchain)
+            .field("rpc_url", &self.rpc_url)
+            .field("pull_interval", &self.pull_interval)
+            .field("url_ttl", &self.url_ttl)
+            .field(
+                "signer_key",
+                &self.signer_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("config_file", &self.config_file)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_default_env()
@@ -130,8 +150,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .allow_headers(Any);
 
     let image_manager = ImageManager::new();
-    let db_path = std::env::var("SQLITE_DB_PATH")
-        .unwrap_or_else(|_| "./proof_requests.db".to_string());
+    let db_path =
+        std::env::var("SQLITE_DB_PATH").unwrap_or_else(|_| "./proof_requests.db".to_string());
     let storage = RequestStorage::new(db_path);
 
     tracing::info!("Initializing provers...");
@@ -147,12 +167,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let rpc_url = boundless_config.rpc_url.clone().unwrap_or(args.rpc_url);
 
+    let signer_key = args
+        .signer_key
+        .clone()
+        .or_else(|| std::env::var("BOUNDLESS_SIGNER_KEY").ok())
+        .expect("BOUNDLESS_SIGNER_KEY is not set and --signer-key not provided");
+
     let prover_config = ProverConfig {
         offchain: args.offchain,
         pull_interval: args.pull_interval,
         rpc_url,
         boundless_config,
         url_ttl: args.url_ttl,
+        signer_key,
     };
     tracing::info!("Start with prover config: {:?}", prover_config);
 
@@ -188,7 +215,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/requests", get(list_async_requests))
         .route("/requests", delete(delete_all_requests))
         .route("/stats", get(get_database_stats))
-        .route("/upload-image/:prover_type/:image_type", post(upload_image_handler))
+        .route(
+            "/upload-image/:prover_type/:image_type",
+            post(upload_image_handler),
+        )
         .route("/images", get(image_info_handler))
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", docs.clone()))
         .merge(Scalar::with_url("/scalar", docs.clone()))
@@ -246,5 +276,24 @@ mod tests {
 
         assert!(DeploymentType::from_str("invalid").is_err());
         assert!(DeploymentType::from_str("").is_err());
+    }
+
+    #[test]
+    fn cmd_args_debug_redacts_secrets() {
+        let args = CmdArgs {
+            address: "0.0.0.0".to_string(),
+            port: 9999,
+            offchain: false,
+            rpc_url: "https://example.invalid".to_string(),
+            pull_interval: 10,
+            url_ttl: 1800,
+            signer_key: Some("0xdeadbeef".to_string()),
+            config_file: Some("config.json".to_string()),
+            api_key: Some("supersecret".to_string()),
+        };
+
+        let debug = format!("{:?}", args);
+        assert!(!debug.contains("supersecret"));
+        assert!(!debug.contains("0xdeadbeef"));
     }
 }

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -30,7 +30,7 @@ impl RateLimiter {
         let max_requests = std::env::var("RATE_LIMIT_PER_MINUTE")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(100); // Default: 100 requests per minute
+            .unwrap_or(0); // Default: disabled
 
         Self::new(max_requests)
     }
@@ -38,10 +38,16 @@ impl RateLimiter {
     /// Check if the given IP is within rate limits
     /// Returns true if request should be allowed, false if rate limited
     pub async fn check(&self, ip: IpAddr) -> bool {
+        if self.max_requests == 0 {
+            return true;
+        }
+
         let mut state = self.state.write().await;
         let now = Instant::now();
 
-        let entry = state.entry(ip).or_insert((0, now));
+        // Global limiter: ignore per-IP and aggregate counts.
+        let key = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let entry = state.entry(key).or_insert((0, now));
 
         // Reset window if expired
         if now.duration_since(entry.1) > self.window {
@@ -86,30 +92,31 @@ mod tests {
     use std::net::Ipv4Addr;
 
     #[tokio::test]
-    async fn test_rate_limiter_allows_within_limit() {
-        let limiter = RateLimiter::new(5);
+    async fn test_rate_limiter_disabled_allows() {
+        let limiter = RateLimiter::new(0);
         let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
-        for _ in 0..5 {
-            assert!(
-                limiter.check(ip).await,
-                "Should allow requests within limit"
-            );
+        for _ in 0..10 {
+            assert!(limiter.check(ip).await, "Disabled limiter should allow");
         }
     }
 
     #[tokio::test]
-    async fn test_rate_limiter_blocks_over_limit() {
+    async fn test_rate_limiter_blocks_over_limit_global() {
         let limiter = RateLimiter::new(3);
-        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let ip1 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let ip2 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
 
-        // Use up the limit
-        for _ in 0..3 {
-            limiter.check(ip).await;
-        }
+        // Use up the global limit across different IPs
+        assert!(limiter.check(ip1).await);
+        assert!(limiter.check(ip2).await);
+        assert!(limiter.check(ip1).await);
 
-        // Should be blocked
-        assert!(!limiter.check(ip).await, "Should block request over limit");
+        // Should be blocked regardless of IP
+        assert!(
+            !limiter.check(ip2).await,
+            "Should block once global limit is reached"
+        );
     }
 
     #[tokio::test]
@@ -134,27 +141,6 @@ mod tests {
 
         // Should allow again
         assert!(limiter.check(ip).await, "Should allow after window reset");
-    }
-
-    #[tokio::test]
-    async fn test_rate_limiter_per_ip_isolation() {
-        let limiter = RateLimiter::new(2);
-        let ip1 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-        let ip2 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
-
-        // IP1 uses its limit
-        limiter.check(ip1).await;
-        limiter.check(ip1).await;
-
-        // IP2 should still have its own limit
-        assert!(
-            limiter.check(ip2).await,
-            "IP2 should have independent limit"
-        );
-        assert!(
-            limiter.check(ip2).await,
-            "IP2 should have independent limit"
-        );
     }
 
     #[tokio::test]

@@ -2,11 +2,7 @@ use crate::types::{AgentError, ElfType, ProverType};
 use alloy_primitives_v1p2p0::hex;
 use risc0_zkvm::sha::Digest;
 use serde::Serialize;
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::SystemTime,
-};
+use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use tokio::sync::RwLock;
 use url::Url;
 use utoipa::ToSchema;

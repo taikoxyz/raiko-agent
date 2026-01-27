@@ -58,12 +58,17 @@ fn map_status_to_api_response(request: &AsyncProofRequest) -> DetailedStatusResp
     };
 
     let provider_request_id = match &request.status {
-        ProofRequestStatus::Submitted { provider_request_id, .. }
+        ProofRequestStatus::Submitted {
+            provider_request_id,
+            ..
+        }
         | ProofRequestStatus::Locked {
-            provider_request_id, ..
+            provider_request_id,
+            ..
         }
         | ProofRequestStatus::Fulfilled {
-            provider_request_id, ..
+            provider_request_id,
+            ..
         } => Some(provider_request_id.clone()),
         _ => request.provider_request_id.clone(),
     };
