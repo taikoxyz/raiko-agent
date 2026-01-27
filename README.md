@@ -47,7 +47,7 @@ curl -X POST http://localhost:9999/proof \
     "prover_type": "boundless",
     "input": [1, 2, 3, 4, 5],
     "output": [1, 2, 3, 4, 5],
-    "proof_type": "Batch"
+    "proof_type": "batch"
   }'
 ```
 
@@ -107,11 +107,12 @@ are required.
 
 ## Environment Variables
 
-- `BOUNDLESS_SIGNER_KEY` (required for boundless): private key used to sign transactions
+- `BOUNDLESS_SIGNER_KEY` (required for boundless): private key used to sign transactions (can be overridden with `--signer-key`)
 - `BOUNDLESS_RPC_URL` (optional): RPC URL if not set in config
 - `SQLITE_DB_PATH` (optional): defaults to `./proof_requests.db`
-- `RATE_LIMIT_PER_MINUTE` (optional): defaults to `100`
+- `RATE_LIMIT_PER_MINUTE` (optional): defaults to `0` (disabled)
 - `BOUNDLESS_API_KEY` (optional): if set, non-health endpoints require `x-api-key` or `Authorization: Bearer`
+- `ALLOW_UNAUTHENTICATED` (optional): set to `true` to allow destructive endpoints without an API key
 
 ## Docker
 

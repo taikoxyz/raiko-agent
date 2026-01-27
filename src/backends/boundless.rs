@@ -19,15 +19,15 @@ use boundless_market::{
     input::GuestEnv,
     request_builder::OfferParams,
 };
-use url::Url;
 use risc0_ethereum_contracts_boundless::receipt::{Receipt as ContractReceipt, decode_seal};
-use risc0_zkvm::{compute_image_id, Digest, Receipt as ZkvmReceipt, Journal, default_executor};
+use risc0_zkvm::{Digest, Journal, Receipt as ZkvmReceipt, compute_image_id, default_executor};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+use url::Url;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DeploymentType {
@@ -171,6 +171,7 @@ impl BoundlessConfig {
     }
 
     /// Get the effective deployment configuration by merging with base deployment
+    #[allow(clippy::collapsible_if)]
     pub fn get_effective_deployment(&self) -> Deployment {
         let deployment_type = self.get_deployment_type();
         let mut deployment = match deployment_type {
@@ -211,6 +212,7 @@ pub struct ProverConfig {
     pub rpc_url: String,
     pub boundless_config: BoundlessConfig,
     pub url_ttl: u64,
+    pub signer_key: String,
 }
 
 #[derive(Clone, Debug)]
@@ -240,11 +242,13 @@ impl BoundlessProver {
         let deployment = Some(self.deployment.clone());
         let storage_provider = boundless_market::storage::storage_provider_from_env().ok();
 
-        let url = Url::parse(&self.config.rpc_url).unwrap();
-        let sender_priv_key = std::env::var("BOUNDLESS_SIGNER_KEY").unwrap_or_else(|_| {
-            panic!("BOUNDLESS_SIGNER_KEY is not set");
-        });
-        let signer: PrivateKeySigner = sender_priv_key.parse().unwrap();
+        let url = Url::parse(&self.config.rpc_url)
+            .map_err(|e| AgentError::ClientBuildError(e.to_string()))?;
+        let signer: PrivateKeySigner = self
+            .config
+            .signer_key
+            .parse()
+            .map_err(|e| AgentError::ClientBuildError(format!("invalid signer key: {e}")))?;
 
         let client = Client::builder()
             .with_rpc_url(url)
@@ -402,107 +406,107 @@ impl BoundlessProver {
                         )
                         .await;
 
-	                        match fulfillment_result {
-	                            Ok(fulfillment) => {
-	                                let fulfillment_data = match fulfillment.data() {
-	                                    Ok(fulfillment_data) => fulfillment_data,
-	                                    Err(e) => {
-	                                        tracing::error!(
-	                                            "Failed to decode fulfillment data for {}: {}",
-	                                            request_id_str,
-	                                            e
-	                                        );
-	                                        return Ok(ProofRequestStatus::Failed {
-	                                            error: AgentError::FulfillmentDecodeError(
-	                                                e.to_string(),
-	                                            )
-	                                            .to_string(),
-	                                        });
-	                                    }
-	                                };
+                        match fulfillment_result {
+                            Ok(fulfillment) => {
+                                let fulfillment_data = match fulfillment.data() {
+                                    Ok(fulfillment_data) => fulfillment_data,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Failed to decode fulfillment data for {}: {}",
+                                            request_id_str,
+                                            e
+                                        );
+                                        return Ok(ProofRequestStatus::Failed {
+                                            error: AgentError::FulfillmentDecodeError(
+                                                e.to_string(),
+                                            )
+                                            .to_string(),
+                                        });
+                                    }
+                                };
 
-	                                let journal = match fulfillment_data.journal() {
-	                                    Some(j) => j.to_vec(),
-	                                    None => {
-	                                        tracing::error!(
-	                                            "No journal found in fulfillment data for {}",
-	                                            request_id_str
-	                                        );
-	                                        return Ok(ProofRequestStatus::Failed {
-	                                            error: AgentError::MissingJournalError.to_string(),
-	                                        });
-	                                    }
-	                                };
+                                let journal = match fulfillment_data.journal() {
+                                    Some(j) => j.to_vec(),
+                                    None => {
+                                        tracing::error!(
+                                            "No journal found in fulfillment data for {}",
+                                            request_id_str
+                                        );
+                                        return Ok(ProofRequestStatus::Failed {
+                                            error: AgentError::MissingJournalError.to_string(),
+                                        });
+                                    }
+                                };
 
-	                                let seal = fulfillment.seal;
+                                let seal = fulfillment.seal;
 
-	                                // Decode boundless receipt only for batch proofs.
-	                                // Prefer the on-chain fulfillment image ID (survives agent restarts), fall back to
-	                                // cached image IDs if needed.
-	                                let receipt = match proof_type {
-	                                    ProofType::Batch => {
-	                                        let image_id = match fulfillment_data.image_id() {
-	                                            Some(image_id) => Some(image_id),
-	                                            None => {
-	                                                self.image_manager
-	                                                    .get_image_id(
-	                                                        ProverType::Boundless,
-	                                                        ElfType::Batch,
-	                                                    )
-	                                                    .await
-	                                            }
-	                                        };
+                                // Decode boundless receipt only for batch proofs.
+                                // Prefer the on-chain fulfillment image ID (survives agent restarts), fall back to
+                                // cached image IDs if needed.
+                                let receipt = match proof_type {
+                                    ProofType::Batch => {
+                                        let image_id = match fulfillment_data.image_id() {
+                                            Some(image_id) => Some(image_id),
+                                            None => {
+                                                self.image_manager
+                                                    .get_image_id(
+                                                        ProverType::Boundless,
+                                                        ElfType::Batch,
+                                                    )
+                                                    .await
+                                            }
+                                        };
 
-	                                        match image_id {
-	                                            Some(image_id) => {
-	                                                match decode_seal(
-	                                                    seal.clone(),
-	                                                    image_id,
-	                                                    journal.clone(),
-	                                                ) {
-	                                                    Ok(ContractReceipt::Base(
-	                                                        boundless_receipt,
-	                                                    )) => match serde_json::to_string(
-	                                                        &boundless_receipt,
-	                                                    ) {
-	                                                        Ok(json) => Some(json),
-	                                                        Err(e) => {
-	                                                            tracing::warn!(
-	                                                                "Failed to serialize decoded receipt for {}: {}",
-	                                                                request_id_str,
-	                                                                e
-	                                                            );
-	                                                            None
-	                                                        }
-	                                                    },
-	                                                    Ok(ContractReceipt::SetInclusion(_)) => {
-	                                                        tracing::warn!(
-	                                                            "Received set-inclusion receipt for batch proof {}",
-	                                                            request_id_str
-	                                                        );
-	                                                        None
-	                                                    }
-	                                                    Err(e) => {
-	                                                        tracing::warn!(
-	                                                            "Failed to decode receipt from seal for {}: {}",
-	                                                            request_id_str,
-	                                                            e
-	                                                        );
-	                                                        None
-	                                                    }
-	                                                }
-	                                            }
-	                                            None => {
-	                                                tracing::warn!(
-	                                                    "Image ID unavailable when decoding receipt for {}",
-	                                                    request_id_str
-	                                                );
-	                                                None
-	                                            }
-	                                        }
-	                                    }
-	                                    _ => None, // Aggregation and other types get None
-	                                };
+                                        match image_id {
+                                            Some(image_id) => {
+                                                match decode_seal(
+                                                    seal.clone(),
+                                                    image_id,
+                                                    journal.clone(),
+                                                ) {
+                                                    Ok(ContractReceipt::Base(
+                                                        boundless_receipt,
+                                                    )) => match serde_json::to_string(
+                                                        &boundless_receipt,
+                                                    ) {
+                                                        Ok(json) => Some(json),
+                                                        Err(e) => {
+                                                            tracing::warn!(
+                                                                "Failed to serialize decoded receipt for {}: {}",
+                                                                request_id_str,
+                                                                e
+                                                            );
+                                                            None
+                                                        }
+                                                    },
+                                                    Ok(ContractReceipt::SetInclusion(_)) => {
+                                                        tracing::warn!(
+                                                            "Received set-inclusion receipt for batch proof {}",
+                                                            request_id_str
+                                                        );
+                                                        None
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            "Failed to decode receipt from seal for {}: {}",
+                                                            request_id_str,
+                                                            e
+                                                        );
+                                                        None
+                                                    }
+                                                }
+                                            }
+                                            None => {
+                                                tracing::warn!(
+                                                    "Image ID unavailable when decoding receipt for {}",
+                                                    request_id_str
+                                                );
+                                                None
+                                            }
+                                        }
+                                    }
+                                    _ => None, // Aggregation and other types get None
+                                };
 
                                 let response = Risc0Response {
                                     seal: seal.to_vec(),
@@ -652,6 +656,7 @@ impl BoundlessProver {
         Ok(prover)
     }
 
+    #[allow(clippy::collapsible_if)]
     pub async fn upload_image(
         &self,
         elf_type: ElfType,
@@ -708,9 +713,9 @@ impl BoundlessProver {
         );
 
         let client = self.create_boundless_client().await?;
-        let (market_url, refresh_at) =
-            self.upload_with_refresh_meta(&elf_type, &elf_bytes, &client)
-                .await?;
+        let (market_url, refresh_at) = self
+            .upload_with_refresh_meta(&elf_type, &elf_bytes, &client)
+            .await?;
 
         tracing::info!(
             "{} image uploaded successfully. Image ID: {:?}, URL: {}",
@@ -757,8 +762,7 @@ impl BoundlessProver {
             .and_then(|(_, v)| v.parse::<u64>().ok())
             .unwrap_or(3600);
 
-        let refresh_at = SystemTime::now()
-            + Duration::from_secs(expires_secs.saturating_sub(120));
+        let refresh_at = SystemTime::now() + Duration::from_secs(expires_secs.saturating_sub(120));
 
         Ok((market_url, refresh_at))
     }
@@ -911,7 +915,10 @@ impl BoundlessProver {
         status: ProofRequestStatus,
         active_requests: &Arc<RwLock<HashMap<String, AsyncProofRequest>>>,
     ) -> AgentResult<()> {
-        let is_terminal = matches!(status, ProofRequestStatus::Fulfilled { .. } | ProofRequestStatus::Failed { .. });
+        let is_terminal = matches!(
+            status,
+            ProofRequestStatus::Fulfilled { .. } | ProofRequestStatus::Failed { .. }
+        );
 
         // Update status in memory
         {
@@ -1089,6 +1096,7 @@ impl BoundlessProver {
     }
 
     /// Helper method to process input, build request, and submit to market
+    #[allow(clippy::too_many_arguments)]
     async fn process_and_submit_request(
         &self,
         request_id: &str,
@@ -1549,7 +1557,13 @@ impl BoundlessProver {
                 let requests_guard = self.active_requests.read().await;
                 requests_guard
                     .values()
-                    .filter(|req| !matches!(req.status, ProofRequestStatus::Fulfilled { .. } | ProofRequestStatus::Failed { .. }))
+                    .filter(|req| {
+                        !matches!(
+                            req.status,
+                            ProofRequestStatus::Fulfilled { .. }
+                                | ProofRequestStatus::Failed { .. }
+                        )
+                    })
                     .cloned()
                     .collect()
             }
@@ -1622,7 +1636,11 @@ impl BoundlessProver {
         *handle_guard = Some(cleanup_task);
     }
 
-    async fn evaluate_cost(&self, guest_env: &GuestEnv, elf: &[u8]) -> AgentResult<(u64, Vec<u8>)> {
+    async fn _evaluate_cost(
+        &self,
+        guest_env: &GuestEnv,
+        elf: &[u8],
+    ) -> AgentResult<(u64, Vec<u8>)> {
         let (mcycles_count, _journal) = {
             // Dry run the ELF with the input to get the journal and cycle count.
             // This can be useful to estimate the cost of the proving request.
@@ -1649,6 +1667,7 @@ impl BoundlessProver {
         Ok((mcycles_count, _journal))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn build_boundless_request(
         &self,
         boundless_client: &Client,
@@ -1679,8 +1698,8 @@ impl BoundlessProver {
         // })? * U256::from(mcycles_count);
 
         let lock_collateral = parse_staking_token(&offer_spec.lock_collateral)?;
-        let lock_timeout = (offer_spec.lock_timeout_ms_per_mcycle * mcycles_count / 1000u32) as u32;
-        let timeout = (offer_spec.timeout_ms_per_mcycle * mcycles_count / 1000u32) as u32;
+        let lock_timeout = offer_spec.lock_timeout_ms_per_mcycle * mcycles_count / 1000u32;
+        let timeout = offer_spec.timeout_ms_per_mcycle * mcycles_count / 1000u32;
         let ramp_up_period = std::cmp::min(offer_spec.ramp_up_sec, lock_timeout);
 
         let mut request_params = boundless_client
@@ -1793,6 +1812,8 @@ mod tests {
                 rpc_url: None,
             },
             url_ttl: 1800,
+            signer_key: "0x0000000000000000000000000000000000000000000000000000000000000001"
+                .to_string(),
         }
     }
 
@@ -1872,7 +1893,12 @@ mod tests {
 
         // Test async request submission - should return a request ID
         let request_id = prover
-            .batch_run("test_request_id".to_string(), input_bytes, output_bytes, &config)
+            .batch_run(
+                "test_request_id".to_string(),
+                input_bytes,
+                output_bytes,
+                &config,
+            )
             .await
             .unwrap();
         println!("Submitted batch request with ID: {:?}", request_id);
@@ -1893,7 +1919,7 @@ mod tests {
     #[test]
     fn test_deserialize_zkvm_receipt() {
         // let file_name = format!("tests/fixtures/boundless_receipt_test.json");
-        let file_name = format!("tests/fixtures/proof-1306738.bin");
+        let file_name = "tests/fixtures/proof-1306738.bin".to_string();
         let bincode_proof: Vec<u8> = std::fs::read(file_name).unwrap();
         let proof: Risc0Response = bincode::deserialize(&bincode_proof).unwrap();
         println!("Deserialized proof: {:#?}", proof);
@@ -1931,7 +1957,7 @@ mod tests {
         env_logger::try_init().ok();
 
         // Load and deserialize existing proof fixture
-        let file_name = format!("tests/fixtures/proof-1306738.bin");
+        let file_name = "tests/fixtures/proof-1306738.bin".to_string();
         let proof_bytes: Vec<u8> = std::fs::read(file_name).unwrap();
         let proof: Risc0Response = bincode::deserialize(&proof_bytes).unwrap();
         println!("Deserialized proof: {:#?}", proof);
@@ -1944,7 +1970,9 @@ mod tests {
         };
         let input = bincode::serialize(&input_data).unwrap();
         let config = serde_json::Value::default();
-        let output_struct = BoundlessAggregationGuestOutput { journal_digest: Digest::ZERO };
+        let output_struct = BoundlessAggregationGuestOutput {
+            journal_digest: Digest::ZERO,
+        };
         let output = bincode::serialize(&output_struct).unwrap();
 
         // Test async aggregation request submission
@@ -1954,7 +1982,12 @@ mod tests {
             .await
             .unwrap();
         let request_id = prover
-            .aggregate("test_aggregate_request_id".to_string(), input, output, &config)
+            .aggregate(
+                "test_aggregate_request_id".to_string(),
+                input,
+                output,
+                &config,
+            )
             .await
             .unwrap();
         println!("Submitted aggregation request with ID: {:?}", request_id);
@@ -2000,12 +2033,12 @@ mod tests {
 
         if verify_call_res.is_ok() {
             tracing_info!("SNARK verified successfully using {groth16_verifier_addr:?}!");
-            return true;
+            true
         } else {
             tracing_err!(
                 "SNARK verification call to {groth16_verifier_addr:?} failed: {verify_call_res:?}!"
             );
-            return false;
+            false
         }
     }
 
@@ -2014,7 +2047,7 @@ mod tests {
         env_logger::try_init().ok();
 
         // Load a proof file and deserialize to Risc0Response
-        let file_name = format!("tests/fixtures/proof-1306738.bin");
+        let file_name = "tests/fixtures/proof-1306738.bin".to_string();
         let proof_bytes: Vec<u8> = std::fs::read(file_name).expect("Failed to read proof file");
         let proof: Risc0Response =
             bincode::deserialize(&proof_bytes).expect("Failed to deserialize proof");
@@ -2083,6 +2116,8 @@ mod tests {
             rpc_url: "https://custom-rpc.com".to_string(),
             boundless_config,
             url_ttl: 1800,
+            signer_key: "0x0000000000000000000000000000000000000000000000000000000000000001"
+                .to_string(),
         };
 
         // Test that the deployment is created correctly from boundless_config

@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::{Request, State},
-    http::{header, Method, StatusCode},
+    http::{Method, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -9,6 +9,7 @@ use axum::{
 use crate::{AppState, api::types::ErrorResponse};
 
 const API_KEY_HEADER: &str = "x-api-key";
+const ALLOW_UNAUTHENTICATED_ENV: &str = "ALLOW_UNAUTHENTICATED";
 
 fn is_exempt_path(path: &str) -> bool {
     path == "/health"
@@ -16,6 +17,16 @@ fn is_exempt_path(path: &str) -> bool {
         || path.starts_with("/api-docs/")
         || path.starts_with("/docs")
         || path.starts_with("/scalar")
+}
+
+fn is_destructive_request(method: &Method, path: &str) -> bool {
+    method == Method::DELETE && path == "/requests"
+}
+
+fn allow_unauthenticated() -> bool {
+    std::env::var(ALLOW_UNAUTHENTICATED_ENV)
+        .map(|value| value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 fn unauthorized_response() -> Response {
@@ -41,6 +52,11 @@ pub async fn require_api_key(
     let expected = match state.api_key() {
         Some(key) => key,
         None => {
+            if is_destructive_request(request.method(), request.uri().path())
+                && !allow_unauthenticated()
+            {
+                return unauthorized_response();
+            }
             return next.run(request).await;
         }
     };
@@ -66,4 +82,50 @@ pub async fn require_api_key(
     }
 
     unauthorized_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        Router,
+        body::Body,
+        routing::{delete, get},
+    };
+    use tower::util::ServiceExt;
+
+    fn build_state(api_key: Option<String>) -> AppState {
+        let image_manager = crate::ImageManager::new();
+        let storage = crate::RequestStorage::new("test_auth.db".to_string());
+        let registry = crate::ProverRegistry::new(None, None, None);
+        AppState {
+            registry,
+            rate_limiter: crate::RateLimiter::new(0),
+            image_manager,
+            storage,
+            api_key,
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_requests_requires_key_even_when_unset() {
+        let state = build_state(None);
+        let app = Router::new()
+            .route("/requests", delete(|| async { StatusCode::OK }))
+            .route("/health", get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(state, require_api_key));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/requests")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }

@@ -46,19 +46,26 @@ impl FromStr for ProverType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum ElfType {
+    #[serde(alias = "Batch")]
     Batch,
+    #[serde(alias = "Aggregation")]
     Aggregation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
 /// Type of proof to generate
+#[serde(rename_all = "snake_case")]
 pub enum ProofType {
     /// Generate a batch proof
+    #[serde(alias = "Batch")]
     Batch,
     /// Aggregate multiple existing proofs
+    #[serde(alias = "Aggregate")]
     Aggregate,
     /// Update ELF binary
+    #[serde(alias = "Update")]
     Update(ElfType),
 }
 
@@ -134,12 +141,50 @@ pub enum AgentError {
 pub type AgentResult<T> = Result<T, AgentError>;
 
 /// Generate deterministic request ID from input, proof type, and prover type
-pub fn generate_request_id(input: &[u8], proof_type: &ProofType, prover_type: &ProverType) -> String {
+pub fn generate_request_id(
+    input: &[u8],
+    proof_type: &ProofType,
+    prover_type: &ProverType,
+) -> String {
     let input_hash = keccak256(input);
     let proof_type_str = match proof_type {
         ProofType::Batch => "batch",
         ProofType::Aggregate => "aggregate",
         ProofType::Update(_) => "update",
     };
-    format!("{}_{}_{}", hex::encode(input_hash), prover_type.as_str(), proof_type_str)
+    format!(
+        "{}_{}_{}",
+        hex::encode(input_hash),
+        prover_type.as_str(),
+        proof_type_str
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proof_type_accepts_snake_case() {
+        let proof: ProofType = serde_json::from_str("\"batch\"").unwrap();
+        assert!(matches!(proof, ProofType::Batch));
+    }
+
+    #[test]
+    fn proof_type_accepts_pascal_case() {
+        let proof: ProofType = serde_json::from_str("\"Batch\"").unwrap();
+        assert!(matches!(proof, ProofType::Batch));
+    }
+
+    #[test]
+    fn proof_type_update_accepts_snake_case() {
+        let proof: ProofType = serde_json::from_str("{\"update\":\"batch\"}").unwrap();
+        assert!(matches!(proof, ProofType::Update(ElfType::Batch)));
+    }
+
+    #[test]
+    fn proof_type_update_accepts_pascal_case() {
+        let proof: ProofType = serde_json::from_str("{\"Update\":\"Batch\"}").unwrap();
+        assert!(matches!(proof, ProofType::Update(ElfType::Batch)));
+    }
 }

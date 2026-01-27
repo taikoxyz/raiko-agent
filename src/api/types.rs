@@ -18,7 +18,7 @@ pub struct AsyncProofRequestData {
     #[schema(example = json!([1, 2, 3, 4, 5]))]
     pub output: Vec<u8>,
     /// Type of proof to generate
-    #[schema(example = json!("Batch"))]
+    #[schema(example = json!("batch"))]
     pub proof_type: ProofType,
     /// Optional ELF binary data for Update proof type
     #[serde(default, skip_serializing_if = "Option::is_none")]

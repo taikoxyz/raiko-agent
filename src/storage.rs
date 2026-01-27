@@ -52,14 +52,24 @@ impl RequestStorage {
                 let db_path = self.db_path.clone();
                 let conn = tokio_rusqlite::Connection::open(db_path)
                     .await
-                    .map_err(|e| AgentError::ClientBuildError(format!("Failed to open SQLite database: {}", e)))?;
+                    .map_err(|e| {
+                        AgentError::ClientBuildError(format!(
+                            "Failed to open SQLite database: {}",
+                            e
+                        ))
+                    })?;
 
                 conn.call(|conn| {
                     Self::apply_pragmas(conn)?;
                     Ok(())
                 })
                 .await
-                .map_err(|e| AgentError::ClientBuildError(format!("Failed to configure SQLite pragmas: {}", e)))?;
+                .map_err(|e| {
+                    AgentError::ClientBuildError(format!(
+                        "Failed to configure SQLite pragmas: {}",
+                        e
+                    ))
+                })?;
 
                 Ok(conn)
             })
@@ -93,13 +103,13 @@ impl RequestStorage {
                     )
                     "#,
                     [],
-                ).map_err(|e| e)?;
+                )?;
 
                 // Create index for faster status queries
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_status ON proof_requests(status)",
                     [],
-                ).map_err(|e| e)?;
+                )?;
 
                 // Migrate existing database by adding new columns if they don't exist
                 let _ = conn.execute("ALTER TABLE proof_requests ADD COLUMN input_hash TEXT", []);
@@ -111,19 +121,19 @@ impl RequestStorage {
                 conn.execute(
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_input_dedup ON proof_requests(input_hash, proof_type_str, prover_type) WHERE input_hash IS NOT NULL AND proof_type_str IS NOT NULL",
                     [],
-                ).map_err(|e| e)?;
+                )?;
 
                 // Index for status_code based filtering
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_status_code ON proof_requests(status_code)",
                     [],
-                ).map_err(|e| e)?;
+                )?;
 
                 // Create index for TTL-based cleanup
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_ttl_expires_at ON proof_requests(ttl_expires_at)",
                     [],
-                ).map_err(|e| e)?;
+                )?;
 
                 Ok(())
             })
@@ -211,7 +221,7 @@ impl RequestStorage {
                             proof_type_str,
                             ttl_expires_at
                         ],
-                    ).map_err(|e| e)?;
+                    )?;
 
                     Ok(())
                 })
@@ -221,14 +231,17 @@ impl RequestStorage {
                 Ok(_) => return Ok(()),
                 Err(e) if Self::is_locked_error(&e) && attempt < 2 => {
                     last_err = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt + 1) as u64)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        200 * (attempt + 1) as u64,
+                    ))
+                    .await;
                     continue;
                 }
                 Err(e) => {
                     return Err(AgentError::ClientBuildError(format!(
                         "Failed to store request: {}",
                         e
-                    )))
+                    )));
                 }
             }
         }
@@ -299,7 +312,7 @@ impl RequestStorage {
                                 request_id
                             ],
                         )
-                        .map_err(|e| e)?;
+                        ?;
                     } else {
                         conn.execute(
                             r#"
@@ -316,7 +329,7 @@ impl RequestStorage {
                                 request_id
                             ],
                         )
-                        .map_err(|e| e)?;
+                        ?;
                     }
 
                     Ok(())
@@ -327,14 +340,17 @@ impl RequestStorage {
                 Ok(_) => return Ok(()),
                 Err(e) if Self::is_locked_error(&e) && attempt < 2 => {
                     last_err = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt + 1) as u64)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        200 * (attempt + 1) as u64,
+                    ))
+                    .await;
                     continue;
                 }
                 Err(e) => {
                     return Err(AgentError::ClientBuildError(format!(
                         "Failed to update status: {}",
                         e
-                    )))
+                    )));
                 }
             }
         }
@@ -361,11 +377,11 @@ impl RequestStorage {
                     WHERE request_id = ?1
                     "#,
                     )
-                    .map_err(|e| e)?;
+                    ?;
 
                 let mut rows = stmt.query_map([request_id], |row| {
                     Self::parse_request_row(row)
-                }).map_err(|e| e)?;
+                })?;
 
                 match rows.next() {
                     Some(Ok(request)) => Ok(Some(request)),
@@ -393,7 +409,7 @@ impl RequestStorage {
                     ORDER BY updated_at DESC
                     "#,
                     )
-                    .map_err(|e| e)?;
+                    ?;
 
                 let rows = stmt.query_map([], |row| {
                     // Only parse minimal fields; leave input/config empty to avoid BLOB overhead.
@@ -437,7 +453,7 @@ impl RequestStorage {
                         input: Vec::new(), // omitted to reduce I/O
                         config: serde_json::Value::Null, // omitted
                     })
-                }).map_err(|e| e)?;
+                })?;
 
                 let mut requests = Vec::new();
                 for row in rows {
@@ -470,7 +486,7 @@ impl RequestStorage {
                     ORDER BY updated_at ASC
                     "#,
                     )
-                    .map_err(|e| e)?;
+                    ?;
 
                 let rows = stmt.query_map([], |row| {
                     let request_id: String = row.get(0)?;
@@ -513,7 +529,7 @@ impl RequestStorage {
                         input: Vec::new(),               // omitted
                         config: serde_json::Value::Null, // omitted
                     })
-                }).map_err(|e| e)?;
+                })?;
 
                 let mut requests = Vec::new();
                 for row in rows {
@@ -596,11 +612,11 @@ impl RequestStorage {
                     ORDER BY updated_at DESC
                     LIMIT 1
                     "#
-                ).map_err(|e| e)?;
+                )?;
 
                 let mut rows = stmt.query_map([input_hash, proof_type_str, prover_type_str], |row| {
                     Self::parse_request_row(row)
-                }).map_err(|e| e)?;
+                })?;
 
                 match rows.next() {
                     Some(Ok(request)) => Ok(Some(request)),
@@ -620,23 +636,19 @@ impl RequestStorage {
             .call(move |conn| {
                 Self::apply_pragmas(conn)?;
                 // First, get the request IDs that will be deleted
-                let mut stmt = conn
-                    .prepare(
-                        r#"
+                let mut stmt = conn.prepare(
+                    r#"
                     SELECT request_id FROM proof_requests 
                     WHERE updated_at < (strftime('%s', 'now') - 7200)
                     AND ((status_code IS NOT NULL AND status_code NOT IN ('fulfilled','failed'))
                          OR (status_code IS NULL AND status NOT LIKE '%Fulfilled%'))
                     "#,
-                    )
-                    .map_err(|e| e)?;
+                )?;
 
-                let rows = stmt
-                    .query_map([], |row| {
-                        let request_id: String = row.get(0)?;
-                        Ok(request_id)
-                    })
-                    .map_err(|e| e)?;
+                let rows = stmt.query_map([], |row| {
+                    let request_id: String = row.get(0)?;
+                    Ok(request_id)
+                })?;
 
                 let mut deleted_ids = Vec::new();
                 for row in rows {
@@ -649,16 +661,15 @@ impl RequestStorage {
                 }
 
                 // Now delete the expired requests
-                let deleted_count = conn
-                    .execute(
-                        r#"
+                let deleted_count = conn.execute(
+                    r#"
                     DELETE FROM proof_requests 
                     WHERE updated_at < (strftime('%s', 'now') - 7200)
-                    AND status NOT LIKE '%Fulfilled%'
+                    AND ((status_code IS NOT NULL AND status_code NOT IN ('fulfilled','failed'))
+                         OR (status_code IS NULL AND status NOT LIKE '%Fulfilled%'))
                     "#,
-                        [],
-                    )
-                    .map_err(|e| e)?;
+                    [],
+                )?;
 
                 if deleted_count > 0 {
                     tracing::info!(
@@ -691,14 +702,14 @@ impl RequestStorage {
                     AND (status LIKE '%Fulfilled%' OR status LIKE '%Failed%')
                     "#,
                     )
-                    .map_err(|e| e)?;
+                    ?;
 
                 let rows = stmt
                     .query_map([], |row| {
                         let request_id: String = row.get(0)?;
                         Ok(request_id)
                     })
-                    .map_err(|e| e)?;
+                    ?;
 
                 let mut deleted_ids = Vec::new();
                 for row in rows {
@@ -721,7 +732,7 @@ impl RequestStorage {
                     "#,
                         [],
                     )
-                    .map_err(|e| e)?;
+                    ?;
 
                 if deleted_count > 0 {
                     tracing::info!(
@@ -748,9 +759,7 @@ impl RequestStorage {
             .await?
             .call(move |conn| {
                 Self::apply_pragmas(conn)?;
-                let deleted_count = conn
-                    .execute("DELETE FROM proof_requests", [])
-                    .map_err(|e| e)?;
+                let deleted_count = conn.execute("DELETE FROM proof_requests", [])?;
 
                 tracing::info!("Deleted {} requests from database", deleted_count);
                 Ok(deleted_count)
@@ -833,4 +842,115 @@ pub struct DatabaseStats {
     pub active_requests: u64,
     pub completed_requests: u64,
     pub failed_requests: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_db_path() -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("/tmp/raiko-agent-test-{}.db", nanos)
+    }
+
+    async fn insert_failed_request(
+        conn: &tokio_rusqlite::Connection,
+        request_id: String,
+        updated_at: i64,
+        ttl_expires_at: i64,
+    ) {
+        let status = ProofRequestStatus::Failed {
+            error: "oops".to_string(),
+        };
+        let status_json = serde_json::to_string(&status).unwrap();
+        let proof_type = ProofType::Batch;
+        let proof_type_json = serde_json::to_string(&proof_type).unwrap();
+        let config_json = serde_json::to_string(&serde_json::Value::Null).unwrap();
+
+        conn.call(move |conn| {
+            conn.execute(
+                r#"
+                INSERT INTO proof_requests
+                (request_id, prover_type, provider_request_id, status, status_code, proof_type, input_data, config_data,
+                 updated_at, proof_data, error_message, input_hash, proof_type_str, ttl_expires_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                "#,
+                params![
+                    request_id,
+                    ProverType::Boundless.as_str(),
+                    Option::<String>::None,
+                    status_json,
+                    "failed",
+                    proof_type_json,
+                    Vec::<u8>::new(),
+                    config_json,
+                    updated_at,
+                    Option::<Vec<u8>>::None,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    "batch",
+                    ttl_expires_at
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn count_request(conn: &tokio_rusqlite::Connection, request_id: String) -> i64 {
+        conn.call(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM proof_requests WHERE request_id = ?1",
+                [request_id],
+                |row| row.get(0),
+            )
+            .map_err(tokio_rusqlite::Error::from)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_requests_cleanup_via_ttl_only() {
+        let db_path = temp_db_path();
+        let storage = RequestStorage::new(db_path.clone());
+        storage.initialize().await.unwrap();
+
+        let conn = tokio_rusqlite::Connection::open(db_path.clone())
+            .await
+            .unwrap();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let updated_at = now - 7201;
+        let ttl_expires_at = now - 1;
+        let request_id = "req_failed_old".to_string();
+
+        insert_failed_request(&conn, request_id.clone(), updated_at, ttl_expires_at).await;
+
+        let deleted = storage.delete_expired_requests().await.unwrap();
+        assert!(
+            !deleted.contains(&request_id),
+            "Failed requests should not be deleted by non-terminal cleanup"
+        );
+
+        let remaining_after_nonterminal = count_request(&conn, request_id.clone()).await;
+        assert_eq!(remaining_after_nonterminal, 1);
+
+        let deleted_ttl = storage.delete_expired_ttl_requests().await.unwrap();
+        assert!(
+            deleted_ttl.contains(&request_id),
+            "Failed requests should be deleted by TTL cleanup"
+        );
+
+        let remaining_after_ttl = count_request(&conn, request_id).await;
+        assert_eq!(remaining_after_ttl, 0);
+    }
 }
