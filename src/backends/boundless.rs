@@ -243,7 +243,11 @@ impl BoundlessProver {
 
         let url = Url::parse(&self.config.rpc_url)
             .map_err(|e| AgentError::ClientBuildError(e.to_string()))?;
-        let signer: PrivateKeySigner = self.config.signer_key.parse().unwrap();
+        let signer: PrivateKeySigner = self
+            .config
+            .signer_key
+            .parse()
+            .map_err(|e| AgentError::ClientBuildError(format!("invalid signer key: {e}")))?;
 
         let client = Client::builder()
             .with_rpc_url(url)
