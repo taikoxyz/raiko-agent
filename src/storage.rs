@@ -1022,8 +1022,7 @@ impl RequestStorage {
                 })?;
 
                 let mut entries = Vec::new();
-                for (prover_type, elf_type, image_id_hex, file_path, updated_at) in rows.flatten()
-                {
+                for (prover_type, elf_type, image_id_hex, file_path, updated_at) in rows.flatten() {
                     let image_bytes = match std::fs::read(&file_path) {
                         Ok(bytes) => bytes,
                         Err(_) => continue,
