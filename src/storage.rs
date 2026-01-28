@@ -907,7 +907,7 @@ impl RequestStorage {
                     "#,
                 )?;
 
-                let rows = stmt.query_map([], |row| Self::parse_request_row(row))?;
+                let rows = stmt.query_map([], Self::parse_request_row)?;
 
                 let mut requests = Vec::new();
                 for row in rows {
@@ -1022,30 +1022,28 @@ impl RequestStorage {
                 })?;
 
                 let mut entries = Vec::new();
-                for row in rows {
-                    if let Ok((prover_type, elf_type, image_id_hex, file_path, updated_at)) = row {
-                        let image_bytes = match std::fs::read(&file_path) {
-                            Ok(bytes) => bytes,
-                            Err(_) => continue,
-                        };
-                        let image_id_bytes =
-                            match hex::decode(image_id_hex.trim_start_matches("0x")) {
-                                Ok(bytes) => bytes,
-                                Err(_) => continue,
-                            };
-                        let image_id = match Digest::try_from(image_id_bytes.as_slice()) {
-                            Ok(digest) => digest,
-                            Err(_) => continue,
-                        };
+                for (prover_type, elf_type, image_id_hex, file_path, updated_at) in rows.flatten()
+                {
+                    let image_bytes = match std::fs::read(&file_path) {
+                        Ok(bytes) => bytes,
+                        Err(_) => continue,
+                    };
+                    let image_id_bytes = match hex::decode(image_id_hex.trim_start_matches("0x")) {
+                        Ok(bytes) => bytes,
+                        Err(_) => continue,
+                    };
+                    let image_id = match Digest::try_from(image_id_bytes.as_slice()) {
+                        Ok(digest) => digest,
+                        Err(_) => continue,
+                    };
 
-                        entries.push(ImageCacheEntry {
-                            prover_type,
-                            elf_type,
-                            image_id,
-                            elf_bytes: image_bytes,
-                            updated_at: updated_at as u64,
-                        });
-                    }
+                    entries.push(ImageCacheEntry {
+                        prover_type,
+                        elf_type,
+                        image_id,
+                        elf_bytes: image_bytes,
+                        updated_at: updated_at as u64,
+                    });
                 }
 
                 Ok(entries)
