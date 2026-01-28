@@ -69,10 +69,21 @@ const MILLION_CYCLES: u64 = 1_000_000;
 const STAKE_TOKEN_DECIMALS: u8 = 18;
 const MAX_SUBMISSION_ATTEMPTS: u32 = 5;
 
-fn resubmit_plan(proof_type: &ProofType) -> Option<(ElfType, ProofType)> {
+fn resubmit_context(
+    config: &BoundlessConfig,
+    proof_type: &ProofType,
+) -> Option<(ElfType, ProofType, BoundlessOfferParams)> {
     match proof_type {
-        ProofType::Batch => Some((ElfType::Batch, ProofType::Batch)),
-        ProofType::Aggregate => Some((ElfType::Aggregation, ProofType::Aggregate)),
+        ProofType::Batch => Some((
+            ElfType::Batch,
+            ProofType::Batch,
+            config.get_batch_offer_params(),
+        )),
+        ProofType::Aggregate => Some((
+            ElfType::Aggregation,
+            ProofType::Aggregate,
+            config.get_aggregation_offer_params(),
+        )),
         ProofType::Update(_) => None,
     }
 }
@@ -687,6 +698,7 @@ impl BoundlessProver {
         }
 
         prover.resume_pending_requests().await;
+        prover.resume_preparing_requests().await;
 
         // Start background TTL cleanup task
         Self::start_ttl_cleanup_task(prover.storage.clone(), prover.active_requests.clone()).await;
@@ -835,6 +847,15 @@ impl BoundlessProver {
         &self.storage
     }
 
+    async fn track_active_request(&self, request: &AsyncProofRequest) -> bool {
+        let mut requests_guard = self.active_requests.write().await;
+        if requests_guard.contains_key(&request.request_id) {
+            return false;
+        }
+        requests_guard.insert(request.request_id.clone(), request.clone());
+        true
+    }
+
     async fn resume_pending_requests(&self) {
         let pending = match self.storage.get_pending_requests().await {
             Ok(requests) => requests,
@@ -880,12 +901,9 @@ impl BoundlessProver {
                 continue;
             }
 
-            let mut requests_guard = self.active_requests.write().await;
-            if requests_guard.contains_key(&request.request_id) {
+            if !self.track_active_request(&request).await {
                 continue;
             }
-            requests_guard.insert(request.request_id.clone(), request.clone());
-            drop(requests_guard);
 
             self.start_status_polling(
                 &request.request_id,
@@ -895,7 +913,9 @@ impl BoundlessProver {
             )
             .await;
         }
+    }
 
+    async fn resume_preparing_requests(&self) {
         let preparing = match self.storage.get_preparing_requests().await {
             Ok(requests) => requests,
             Err(e) => {
@@ -919,7 +939,9 @@ impl BoundlessProver {
                 continue;
             }
 
-            let Some((elf_type, proof_type)) = resubmit_plan(&request.proof_type) else {
+            let Some((elf_type, proof_type, offer_params)) =
+                resubmit_context(&self.boundless_config, &request.proof_type)
+            else {
                 tracing::warn!(
                     "Skipping resubmit for update request {}",
                     request.request_id
@@ -950,17 +972,9 @@ impl BoundlessProver {
                 continue;
             };
 
-            let offer_params = match proof_type {
-                ProofType::Batch => self.boundless_config.get_batch_offer_params(),
-                ProofType::Aggregate => self.boundless_config.get_aggregation_offer_params(),
-                ProofType::Update(_) => continue,
-            };
-
-            let mut requests_guard = self.active_requests.write().await;
-            if !requests_guard.contains_key(&request.request_id) {
-                requests_guard.insert(request.request_id.clone(), request.clone());
+            if !self.track_active_request(&request).await {
+                continue;
             }
-            drop(requests_guard);
 
             let active_requests = self.active_requests.clone();
             let prover_clone = self.clone();
@@ -2434,15 +2448,34 @@ mod tests {
     }
 
     #[test]
-    fn resubmit_plan_maps_proof_type() {
-        assert!(resubmit_plan(&ProofType::Update(ElfType::Batch)).is_none());
+    fn resubmit_context_maps_proof_type() {
+        let config = BoundlessConfig {
+            deployment: Some(DeploymentConfig {
+                deployment_type: Some(DeploymentType::Base),
+                overrides: None,
+            }),
+            offer_params: test_offer_params_config(),
+            rpc_url: None,
+        };
 
-        let (elf_type, proof_type) = resubmit_plan(&ProofType::Batch).unwrap();
+        assert!(resubmit_context(&config, &ProofType::Update(ElfType::Batch)).is_none());
+
+        let (elf_type, proof_type, offer_params) =
+            resubmit_context(&config, &ProofType::Batch).unwrap();
         assert!(matches!(elf_type, ElfType::Batch));
         assert!(matches!(proof_type, ProofType::Batch));
+        assert_eq!(
+            offer_params.max_price_per_mcycle,
+            config.offer_params.batch.max_price_per_mcycle
+        );
 
-        let (elf_type, proof_type) = resubmit_plan(&ProofType::Aggregate).unwrap();
+        let (elf_type, proof_type, offer_params) =
+            resubmit_context(&config, &ProofType::Aggregate).unwrap();
         assert!(matches!(elf_type, ElfType::Aggregation));
         assert!(matches!(proof_type, ProofType::Aggregate));
+        assert_eq!(
+            offer_params.max_price_per_mcycle,
+            config.offer_params.aggregation.max_price_per_mcycle
+        );
     }
 }
