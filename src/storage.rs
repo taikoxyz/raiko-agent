@@ -872,19 +872,15 @@ impl RequestStorage {
             .await?
             .call(move |conn| {
                 Self::apply_pragmas(conn)?;
-                conn.execute(
+                let attempts: i64 = conn.query_row(
                     r#"
                     UPDATE proof_requests
                     SET submission_attempts = COALESCE(submission_attempts, 0) + 1,
                         last_attempt_at = ?1
                     WHERE request_id = ?2
+                    RETURNING submission_attempts
                     "#,
                     params![now, request_id],
-                )?;
-
-                let attempts: i64 = conn.query_row(
-                    "SELECT submission_attempts FROM proof_requests WHERE request_id = ?1",
-                    [request_id],
                     |row| row.get(0),
                 )?;
 
@@ -1255,6 +1251,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn increments_submission_attempts_with_update_trigger() {
+        let db_path = temp_db_path();
+        let storage = RequestStorage::new(db_path.clone());
+        storage.initialize().await.unwrap();
+
+        let request = AsyncProofRequest {
+            request_id: "req_attempts_trigger".to_string(),
+            prover_type: ProverType::Boundless,
+            provider_request_id: None,
+            status: ProofRequestStatus::Preparing,
+            proof_type: ProofType::Batch,
+            input: vec![1, 2, 3],
+            output: vec![4, 5, 6],
+            config: serde_json::Value::Null,
+        };
+
+        storage.store_request(&request).await.unwrap();
+
+        storage
+            .open_with_pragmas()
+            .await
+            .unwrap()
+            .call(|conn| {
+                conn.execute(
+                    r#"
+                    CREATE TRIGGER delete_on_attempt_update
+                    AFTER UPDATE OF submission_attempts ON proof_requests
+                    BEGIN
+                        DELETE FROM proof_requests WHERE request_id = NEW.request_id;
+                    END;
+                    "#,
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let attempts = storage
+            .increment_submission_attempts(&request.request_id)
+            .await
+            .unwrap();
+        assert_eq!(attempts, 1);
     }
 
     #[tokio::test]
