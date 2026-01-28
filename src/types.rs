@@ -101,6 +101,7 @@ pub struct AsyncProofRequest {
     pub status: ProofRequestStatus,
     pub proof_type: ProofType,
     pub input: Vec<u8>,
+    pub output: Vec<u8>,
     pub config: serde_json::Value,
 }
 

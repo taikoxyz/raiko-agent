@@ -67,6 +67,26 @@ pub struct BoundlessAggregationGuestOutput {
 const MAX_RETRY_ATTEMPTS: u32 = 5;
 const MILLION_CYCLES: u64 = 1_000_000;
 const STAKE_TOKEN_DECIMALS: u8 = 18;
+const MAX_SUBMISSION_ATTEMPTS: u32 = 5;
+
+fn resubmit_context(
+    config: &BoundlessConfig,
+    proof_type: &ProofType,
+) -> Option<(ElfType, ProofType, BoundlessOfferParams)> {
+    match proof_type {
+        ProofType::Batch => Some((
+            ElfType::Batch,
+            ProofType::Batch,
+            config.get_batch_offer_params(),
+        )),
+        ProofType::Aggregate => Some((
+            ElfType::Aggregation,
+            ProofType::Aggregate,
+            config.get_aggregation_offer_params(),
+        )),
+        ProofType::Update(_) => None,
+    }
+}
 
 fn parse_provider_request_id(provider_request_id: &str) -> Option<U256> {
     let trimmed = provider_request_id.trim_start_matches("0x");
@@ -610,6 +630,26 @@ impl BoundlessProver {
             image_manager: image_manager.clone(),
         };
 
+        match storage.load_images().await {
+            Ok(entries) => {
+                for entry in entries {
+                    if entry.prover_type != ProverType::Boundless {
+                        continue;
+                    }
+                    let info = ImageInfo {
+                        image_id: Some(entry.image_id),
+                        remote_url: None,
+                        elf_bytes: entry.elf_bytes,
+                        refresh_at: None,
+                    };
+                    image_manager
+                        .set_image(entry.prover_type, entry.elf_type, info)
+                        .await;
+                }
+            }
+            Err(e) => tracing::warn!("Failed to load cached images: {}", e),
+        }
+
         // Refresh market URLs if images exist in ImageManager
         // This ensures fresh presigned URLs after prover refresh/TTL expiration
         // The storage provider deduplicates content, so only new URLs are generated
@@ -658,6 +698,7 @@ impl BoundlessProver {
         }
 
         prover.resume_pending_requests().await;
+        prover.resume_preparing_requests().await;
 
         // Start background TTL cleanup task
         Self::start_ttl_cleanup_task(prover.storage.clone(), prover.active_requests.clone()).await;
@@ -741,8 +782,18 @@ impl BoundlessProver {
         };
 
         self.image_manager
-            .set_image(ProverType::Boundless, elf_type, info.clone())
+            .set_image(ProverType::Boundless, elf_type.clone(), info.clone())
             .await;
+
+        if let Some(image_id) = info.image_id {
+            if let Err(e) = self
+                .storage
+                .persist_image(ProverType::Boundless, elf_type, image_id, &info.elf_bytes)
+                .await
+            {
+                tracing::warn!("Failed to persist image cache: {}", e);
+            }
+        }
 
         Ok(ImageUploadResult {
             info,
@@ -796,6 +847,15 @@ impl BoundlessProver {
         &self.storage
     }
 
+    async fn track_active_request(&self, request: &AsyncProofRequest) -> bool {
+        let mut requests_guard = self.active_requests.write().await;
+        if requests_guard.contains_key(&request.request_id) {
+            return false;
+        }
+        requests_guard.insert(request.request_id.clone(), request.clone());
+        true
+    }
+
     async fn resume_pending_requests(&self) {
         let pending = match self.storage.get_pending_requests().await {
             Ok(requests) => requests,
@@ -807,10 +867,9 @@ impl BoundlessProver {
 
         if pending.is_empty() {
             tracing::info!("No pending requests to resume");
-            return;
+        } else {
+            tracing::info!("Resuming polling for {} pending requests", pending.len());
         }
-
-        tracing::info!("Resuming polling for {} pending requests", pending.len());
 
         for request in pending {
             if request.prover_type != ProverType::Boundless {
@@ -842,12 +901,9 @@ impl BoundlessProver {
                 continue;
             }
 
-            let mut requests_guard = self.active_requests.write().await;
-            if requests_guard.contains_key(&request.request_id) {
+            if !self.track_active_request(&request).await {
                 continue;
             }
-            requests_guard.insert(request.request_id.clone(), request.clone());
-            drop(requests_guard);
 
             self.start_status_polling(
                 &request.request_id,
@@ -859,12 +915,98 @@ impl BoundlessProver {
         }
     }
 
+    async fn resume_preparing_requests(&self) {
+        let preparing = match self.storage.get_preparing_requests().await {
+            Ok(requests) => requests,
+            Err(e) => {
+                tracing::warn!("Failed to load preparing requests for resume: {}", e);
+                return;
+            }
+        };
+
+        if preparing.is_empty() {
+            tracing::info!("No preparing requests to resume");
+            return;
+        }
+
+        tracing::info!("Resubmitting {} preparing requests", preparing.len());
+
+        for request in preparing {
+            if request.prover_type != ProverType::Boundless {
+                continue;
+            }
+            if request.provider_request_id.is_some() {
+                continue;
+            }
+
+            let Some((elf_type, proof_type, offer_params)) =
+                resubmit_context(&self.boundless_config, &request.proof_type)
+            else {
+                tracing::warn!(
+                    "Skipping resubmit for update request {}",
+                    request.request_id
+                );
+                continue;
+            };
+
+            let image_info = match self
+                .image_manager
+                .get_image(ProverType::Boundless, elf_type.clone())
+                .await
+            {
+                Some(info) => info,
+                None => {
+                    tracing::warn!(
+                        "Skipping resubmit for {}: image not available",
+                        request.request_id
+                    );
+                    continue;
+                }
+            };
+
+            let Some(image_url) = image_info.remote_url.clone() else {
+                tracing::warn!(
+                    "Skipping resubmit for {}: image URL missing",
+                    request.request_id
+                );
+                continue;
+            };
+
+            if !self.track_active_request(&request).await {
+                continue;
+            }
+
+            let active_requests = self.active_requests.clone();
+            let prover_clone = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = prover_clone
+                    .process_and_submit_request(
+                        &request.request_id,
+                        request.input,
+                        request.output,
+                        &image_info.elf_bytes,
+                        image_url,
+                        offer_params,
+                        proof_type,
+                        active_requests,
+                    )
+                    .await
+                {
+                    prover_clone
+                        .update_failed_status(&request.request_id, e.to_string())
+                        .await;
+                }
+            });
+        }
+    }
+
     /// Helper method to prepare and store async request
     async fn prepare_async_request(
         &self,
         request_id: String,
         proof_type: ProofType,
         input: Vec<u8>,
+        output: Vec<u8>,
         config: &serde_json::Value,
     ) -> AgentResult<String> {
         tracing::info!(
@@ -884,6 +1026,7 @@ impl BoundlessProver {
             status: ProofRequestStatus::Preparing,
             proof_type,
             input,
+            output,
             config: config.clone(),
         };
 
@@ -1117,6 +1260,17 @@ impl BoundlessProver {
         proof_type: ProofType,
         active_requests: Arc<RwLock<HashMap<String, AsyncProofRequest>>>,
     ) -> AgentResult<()> {
+        let attempts = self
+            .storage
+            .increment_submission_attempts(request_id)
+            .await?;
+        if attempts > MAX_SUBMISSION_ATTEMPTS {
+            return Err(AgentError::RequestSubmitError(format!(
+                "submission attempts exceeded ({})",
+                attempts
+            )));
+        }
+
         let boundless_client = retry_with_backoff(
             "create_boundless_client",
             || self.create_boundless_client(),
@@ -1296,7 +1450,13 @@ impl BoundlessProver {
 
         // Prepare and store the async request using the provided request ID
         let final_request_id = self
-            .prepare_async_request(request_id.clone(), ProofType::Batch, input.clone(), config)
+            .prepare_async_request(
+                request_id.clone(),
+                ProofType::Batch,
+                input.clone(),
+                output.clone(),
+                config,
+            )
             .await?;
 
         // Submit to boundless market in background
@@ -1445,6 +1605,7 @@ impl BoundlessProver {
                 request_id.clone(),
                 ProofType::Aggregate,
                 input.clone(),
+                output.clone(),
                 config,
             )
             .await?;
@@ -2284,5 +2445,37 @@ mod tests {
         let offer_params = test_batch_offer_params();
         let result = validate_offer_params(&offer_params, 7000, 2);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn resubmit_context_maps_proof_type() {
+        let config = BoundlessConfig {
+            deployment: Some(DeploymentConfig {
+                deployment_type: Some(DeploymentType::Base),
+                overrides: None,
+            }),
+            offer_params: test_offer_params_config(),
+            rpc_url: None,
+        };
+
+        assert!(resubmit_context(&config, &ProofType::Update(ElfType::Batch)).is_none());
+
+        let (elf_type, proof_type, offer_params) =
+            resubmit_context(&config, &ProofType::Batch).unwrap();
+        assert!(matches!(elf_type, ElfType::Batch));
+        assert!(matches!(proof_type, ProofType::Batch));
+        assert_eq!(
+            offer_params.max_price_per_mcycle,
+            config.offer_params.batch.max_price_per_mcycle
+        );
+
+        let (elf_type, proof_type, offer_params) =
+            resubmit_context(&config, &ProofType::Aggregate).unwrap();
+        assert!(matches!(elf_type, ElfType::Aggregation));
+        assert!(matches!(proof_type, ProofType::Aggregate));
+        assert_eq!(
+            offer_params.max_price_per_mcycle,
+            config.offer_params.aggregation.max_price_per_mcycle
+        );
     }
 }

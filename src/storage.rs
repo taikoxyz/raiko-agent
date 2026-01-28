@@ -1,8 +1,10 @@
 use crate::types::{
-    AgentError, AgentResult, AsyncProofRequest, ProofRequestStatus, ProofType, ProverType,
+    AgentError, AgentResult, AsyncProofRequest, ElfType, ProofRequestStatus, ProofType, ProverType,
 };
-use alloy_primitives_v1p2p0::keccak256;
+use alloy_primitives_v1p2p0::{hex, keccak256};
+use risc0_zkvm::sha::Digest;
 use serde_json;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::OnceCell;
@@ -30,6 +32,17 @@ impl RequestStorage {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(Duration::from_millis(5000))?;
         Ok(())
+    }
+
+    fn image_cache_dir(&self) -> PathBuf {
+        if self.db_path == ":memory:" {
+            return std::env::temp_dir().join("raiko-agent-image-cache");
+        }
+
+        Path::new(&self.db_path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("image_cache")
     }
 
     fn is_locked_error(err: &tokio_rusqlite::Error) -> bool {
@@ -93,13 +106,16 @@ impl RequestStorage {
                         status_code TEXT,
                         proof_type TEXT NOT NULL,
                         input_data BLOB NOT NULL,
+                        output_data BLOB,
                         config_data TEXT NOT NULL,
                         updated_at INTEGER NOT NULL,
                         proof_data BLOB,
                         error_message TEXT,
                         input_hash TEXT,
                         proof_type_str TEXT,
-                        ttl_expires_at INTEGER
+                        ttl_expires_at INTEGER,
+                        submission_attempts INTEGER DEFAULT 0,
+                        last_attempt_at INTEGER
                     )
                     "#,
                     [],
@@ -116,6 +132,10 @@ impl RequestStorage {
                 let _ = conn.execute("ALTER TABLE proof_requests ADD COLUMN proof_type_str TEXT", []);
                 let _ = conn.execute("ALTER TABLE proof_requests ADD COLUMN ttl_expires_at INTEGER", []);
                 let _ = conn.execute("ALTER TABLE proof_requests ADD COLUMN status_code TEXT", []);
+                let _ = conn.execute("ALTER TABLE proof_requests ADD COLUMN output_data BLOB", []);
+                let _ =
+                    conn.execute("ALTER TABLE proof_requests ADD COLUMN submission_attempts INTEGER DEFAULT 0", []);
+                let _ = conn.execute("ALTER TABLE proof_requests ADD COLUMN last_attempt_at INTEGER", []);
 
                 // Create unique index for input deduplication
                 conn.execute(
@@ -132,6 +152,20 @@ impl RequestStorage {
                 // Create index for TTL-based cleanup
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_ttl_expires_at ON proof_requests(ttl_expires_at)",
+                    [],
+                )?;
+
+                conn.execute(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS image_cache (
+                        prover_type TEXT NOT NULL,
+                        elf_type TEXT NOT NULL,
+                        image_id TEXT NOT NULL,
+                        file_path TEXT NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        PRIMARY KEY (prover_type, elf_type)
+                    )
+                    "#,
                     [],
                 )?;
 
@@ -201,9 +235,9 @@ impl RequestStorage {
                     conn.execute(
                         r#"
                         INSERT OR REPLACE INTO proof_requests
-                        (request_id, prover_type, provider_request_id, status, status_code, proof_type, input_data, config_data,
-                         updated_at, proof_data, error_message, input_hash, proof_type_str, ttl_expires_at)
-                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                        (request_id, prover_type, provider_request_id, status, status_code, proof_type, input_data, output_data, config_data,
+                         updated_at, proof_data, error_message, input_hash, proof_type_str, ttl_expires_at, submission_attempts, last_attempt_at)
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                         "#,
                         params![
                             req_clone.request_id,
@@ -213,13 +247,16 @@ impl RequestStorage {
                             status_code,
                             proof_type_json,
                             req_clone.input,
+                            req_clone.output,
                             config_json,
                             now,
                             Option::<Vec<u8>>::None, // proof_data initially None
                             Option::<String>::None,   // error_message initially None
                             input_hash,
                             proof_type_str,
-                            ttl_expires_at
+                            ttl_expires_at,
+                            0u32,
+                            now
                         ],
                     )?;
 
@@ -372,7 +409,7 @@ impl RequestStorage {
                 let mut stmt = conn
                     .prepare(
                         r#"
-                    SELECT request_id, prover_type, provider_request_id, status, proof_type, input_data, config_data
+                    SELECT request_id, prover_type, provider_request_id, status, proof_type, input_data, output_data, config_data
                     FROM proof_requests
                     WHERE request_id = ?1
                     "#,
@@ -402,7 +439,7 @@ impl RequestStorage {
                 let mut stmt = conn
                     .prepare(
                         r#"
-                    SELECT request_id, prover_type, provider_request_id, status, proof_type, input_data, config_data
+                    SELECT request_id, prover_type, provider_request_id, status, proof_type, input_data, output_data, config_data
                     FROM proof_requests
                     WHERE (status_code IS NOT NULL AND status_code NOT IN ('fulfilled','failed'))
                        OR (status_code IS NULL AND status NOT LIKE '%Fulfilled%' AND status NOT LIKE '%Failed%')
@@ -451,6 +488,7 @@ impl RequestStorage {
                         status,
                         proof_type,
                         input: Vec::new(), // omitted to reduce I/O
+                        output: Vec::new(), // omitted
                         config: serde_json::Value::Null, // omitted
                     })
                 })?;
@@ -527,6 +565,7 @@ impl RequestStorage {
                         status,
                         proof_type,
                         input: Vec::new(),               // omitted
+                        output: Vec::new(),              // omitted
                         config: serde_json::Value::Null, // omitted
                     })
                 })?;
@@ -553,7 +592,8 @@ impl RequestStorage {
         let status_json: String = row.get(3)?;
         let proof_type_json: String = row.get(4)?;
         let input_data: Vec<u8> = row.get(5)?;
-        let config_json: String = row.get(6)?;
+        let output_data: Option<Vec<u8>> = row.get(6)?;
+        let config_json: String = row.get(7)?;
 
         let prover_type = ProverType::from_str(&prover_type_str).map_err(|_| {
             rusqlite::Error::InvalidColumnType(
@@ -585,6 +625,7 @@ impl RequestStorage {
             status,
             proof_type,
             input: input_data,
+            output: output_data.unwrap_or_default(),
             config,
         })
     }
@@ -602,16 +643,16 @@ impl RequestStorage {
 
         self.open_with_pragmas()
             .await?
-            .call(move |conn| {
-                Self::apply_pragmas(conn)?;
-                let mut stmt = conn.prepare(
-                    r#"
-                    SELECT request_id, prover_type, provider_request_id, status, proof_type, input_data, config_data
-                    FROM proof_requests
-                    WHERE input_hash = ?1 AND proof_type_str = ?2 AND prover_type = ?3
-                    ORDER BY updated_at DESC
-                    LIMIT 1
-                    "#
+	            .call(move |conn| {
+	                Self::apply_pragmas(conn)?;
+	                let mut stmt = conn.prepare(
+	                    r#"
+	                    SELECT request_id, prover_type, provider_request_id, status, proof_type, input_data, output_data, config_data
+	                    FROM proof_requests
+	                    WHERE input_hash = ?1 AND proof_type_str = ?2 AND prover_type = ?3
+	                    ORDER BY updated_at DESC
+	                    LIMIT 1
+	                    "#
                 )?;
 
                 let mut rows = stmt.query_map([input_hash, proof_type_str, prover_type_str], |row| {
@@ -820,6 +861,196 @@ impl RequestStorage {
             .map_err(|e| AgentError::ClientBuildError(format!("Failed to get database stats: {}", e)))
     }
 
+    pub async fn increment_submission_attempts(&self, request_id: &str) -> AgentResult<u32> {
+        let request_id = request_id.to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        self.open_with_pragmas()
+            .await?
+            .call(move |conn| {
+                Self::apply_pragmas(conn)?;
+                let attempts: i64 = conn.query_row(
+                    r#"
+                    UPDATE proof_requests
+                    SET submission_attempts = COALESCE(submission_attempts, 0) + 1,
+                        last_attempt_at = ?1
+                    WHERE request_id = ?2
+                    RETURNING submission_attempts
+                    "#,
+                    params![now, request_id],
+                    |row| row.get(0),
+                )?;
+
+                Ok(attempts as u32)
+            })
+            .await
+            .map_err(|e| {
+                AgentError::ClientBuildError(format!("Failed to increment attempts: {}", e))
+            })
+    }
+
+    pub async fn get_preparing_requests(&self) -> AgentResult<Vec<AsyncProofRequest>> {
+        self.open_with_pragmas()
+            .await?
+            .call(move |conn| {
+                Self::apply_pragmas(conn)?;
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT request_id, prover_type, provider_request_id, status, proof_type, input_data, output_data, config_data
+                    FROM proof_requests
+                    WHERE (status_code IS NOT NULL AND status_code = 'preparing')
+                       OR (status_code IS NULL AND status LIKE '%Preparing%')
+                    ORDER BY updated_at ASC
+                    "#,
+                )?;
+
+                let rows = stmt.query_map([], Self::parse_request_row)?;
+
+                let mut requests = Vec::new();
+                for row in rows {
+                    match row {
+                        Ok(request) => requests.push(request),
+                        Err(e) => tracing::warn!("Failed to parse preparing request: {}", e),
+                    }
+                }
+
+                Ok(requests)
+            })
+            .await
+            .map_err(|e| {
+                AgentError::ClientBuildError(format!("Failed to get preparing requests: {}", e))
+            })
+    }
+
+    pub async fn persist_image(
+        &self,
+        prover_type: ProverType,
+        elf_type: ElfType,
+        image_id: Digest,
+        elf_bytes: &[u8],
+    ) -> AgentResult<PathBuf> {
+        let dir = self.image_cache_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            AgentError::ClientBuildError(format!("Failed to create image dir: {}", e))
+        })?;
+
+        let elf_type_str = match elf_type {
+            ElfType::Batch => "batch",
+            ElfType::Aggregation => "aggregation",
+        };
+        let filename = format!("{}_{}.elf", prover_type.as_str(), elf_type_str);
+        let path = dir.join(filename);
+        std::fs::write(&path, elf_bytes)
+            .map_err(|e| AgentError::ClientBuildError(format!("Failed to write ELF: {}", e)))?;
+
+        let image_id_hex = hex::encode(image_id.as_bytes());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let path_str = path.to_string_lossy().to_string();
+
+        self.open_with_pragmas()
+            .await?
+            .call(move |conn| {
+                Self::apply_pragmas(conn)?;
+                conn.execute(
+                    r#"
+                    INSERT OR REPLACE INTO image_cache
+                    (prover_type, elf_type, image_id, file_path, updated_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5)
+                    "#,
+                    params![
+                        prover_type.as_str(),
+                        elf_type_str,
+                        image_id_hex,
+                        path_str,
+                        now
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| AgentError::ClientBuildError(format!("Failed to persist image: {}", e)))?;
+
+        Ok(path)
+    }
+
+    pub async fn load_images(&self) -> AgentResult<Vec<ImageCacheEntry>> {
+        self.open_with_pragmas()
+            .await?
+            .call(move |conn| {
+                Self::apply_pragmas(conn)?;
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT prover_type, elf_type, image_id, file_path, updated_at
+                    FROM image_cache
+                    ORDER BY updated_at DESC
+                    "#,
+                )?;
+
+                let rows = stmt.query_map([], |row| {
+                    let prover_type_str: String = row.get(0)?;
+                    let elf_type_str: String = row.get(1)?;
+                    let image_id_hex: String = row.get(2)?;
+                    let file_path: String = row.get(3)?;
+                    let updated_at: i64 = row.get(4)?;
+
+                    let prover_type = ProverType::from_str(&prover_type_str).map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(
+                            0,
+                            "prover_type".to_string(),
+                            rusqlite::types::Type::Text,
+                        )
+                    })?;
+                    let elf_type = match elf_type_str.as_str() {
+                        "batch" => ElfType::Batch,
+                        "aggregation" => ElfType::Aggregation,
+                        _ => {
+                            return Err(rusqlite::Error::InvalidColumnType(
+                                1,
+                                "elf_type".to_string(),
+                                rusqlite::types::Type::Text,
+                            ));
+                        }
+                    };
+
+                    Ok((prover_type, elf_type, image_id_hex, file_path, updated_at))
+                })?;
+
+                let mut entries = Vec::new();
+                for (prover_type, elf_type, image_id_hex, file_path, updated_at) in rows.flatten() {
+                    let image_bytes = match std::fs::read(&file_path) {
+                        Ok(bytes) => bytes,
+                        Err(_) => continue,
+                    };
+                    let image_id_bytes = match hex::decode(image_id_hex.trim_start_matches("0x")) {
+                        Ok(bytes) => bytes,
+                        Err(_) => continue,
+                    };
+                    let image_id = match Digest::try_from(image_id_bytes.as_slice()) {
+                        Ok(digest) => digest,
+                        Err(_) => continue,
+                    };
+
+                    entries.push(ImageCacheEntry {
+                        prover_type,
+                        elf_type,
+                        image_id,
+                        elf_bytes: image_bytes,
+                        updated_at: updated_at as u64,
+                    });
+                }
+
+                Ok(entries)
+            })
+            .await
+            .map_err(|e| AgentError::ClientBuildError(format!("Failed to load images: {}", e)))
+    }
+
     /// Store ELF URL for a given ELF type
     pub async fn store_elf_url(&self, _elf_type: &str, _url: &str) -> AgentResult<()> {
         todo!()
@@ -844,9 +1075,20 @@ pub struct DatabaseStats {
     pub failed_requests: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct ImageCacheEntry {
+    pub prover_type: ProverType,
+    pub elf_type: ElfType,
+    pub image_id: Digest,
+    pub elf_bytes: Vec<u8>,
+    pub updated_at: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ElfType;
+    use risc0_zkvm::sha::Digest;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_db_path() -> String {
@@ -952,5 +1194,157 @@ mod tests {
 
         let remaining_after_ttl = count_request(&conn, request_id).await;
         assert_eq!(remaining_after_ttl, 0);
+    }
+
+    #[tokio::test]
+    async fn persists_and_loads_latest_image() {
+        let db_path = temp_db_path();
+        let storage = RequestStorage::new(db_path.clone());
+        storage.initialize().await.unwrap();
+
+        let elf_bytes = vec![1u8, 2, 3, 4, 5];
+        let image_id = Digest::try_from([0u8; 32].as_slice()).unwrap();
+
+        storage
+            .persist_image(ProverType::Boundless, ElfType::Batch, image_id, &elf_bytes)
+            .await
+            .unwrap();
+
+        let images = storage.load_images().await.unwrap();
+        assert_eq!(images.len(), 1);
+        let entry = &images[0];
+        assert_eq!(entry.prover_type, ProverType::Boundless);
+        assert_eq!(entry.elf_type, ElfType::Batch);
+        assert_eq!(entry.elf_bytes, elf_bytes);
+    }
+
+    #[tokio::test]
+    async fn increments_submission_attempts() {
+        let db_path = temp_db_path();
+        let storage = RequestStorage::new(db_path.clone());
+        storage.initialize().await.unwrap();
+
+        let request = AsyncProofRequest {
+            request_id: "req_attempts".to_string(),
+            prover_type: ProverType::Boundless,
+            provider_request_id: None,
+            status: ProofRequestStatus::Preparing,
+            proof_type: ProofType::Batch,
+            input: vec![1, 2, 3],
+            output: vec![4, 5, 6],
+            config: serde_json::Value::Null,
+        };
+
+        storage.store_request(&request).await.unwrap();
+
+        let attempts = storage
+            .increment_submission_attempts(&request.request_id)
+            .await
+            .unwrap();
+        assert_eq!(attempts, 1);
+
+        let attempts = storage
+            .increment_submission_attempts(&request.request_id)
+            .await
+            .unwrap();
+        assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn increments_submission_attempts_with_update_trigger() {
+        let db_path = temp_db_path();
+        let storage = RequestStorage::new(db_path.clone());
+        storage.initialize().await.unwrap();
+
+        let request = AsyncProofRequest {
+            request_id: "req_attempts_trigger".to_string(),
+            prover_type: ProverType::Boundless,
+            provider_request_id: None,
+            status: ProofRequestStatus::Preparing,
+            proof_type: ProofType::Batch,
+            input: vec![1, 2, 3],
+            output: vec![4, 5, 6],
+            config: serde_json::Value::Null,
+        };
+
+        storage.store_request(&request).await.unwrap();
+
+        storage
+            .open_with_pragmas()
+            .await
+            .unwrap()
+            .call(|conn| {
+                conn.execute(
+                    r#"
+                    CREATE TRIGGER delete_on_attempt_update
+                    AFTER UPDATE OF submission_attempts ON proof_requests
+                    BEGIN
+                        DELETE FROM proof_requests WHERE request_id = NEW.request_id;
+                    END;
+                    "#,
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let attempts = storage
+            .increment_submission_attempts(&request.request_id)
+            .await
+            .unwrap();
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn loads_preparing_requests_with_output() {
+        let db_path = temp_db_path();
+        let storage = RequestStorage::new(db_path.clone());
+        storage.initialize().await.unwrap();
+
+        let request = AsyncProofRequest {
+            request_id: "req_prepare".to_string(),
+            prover_type: ProverType::Boundless,
+            provider_request_id: None,
+            status: ProofRequestStatus::Preparing,
+            proof_type: ProofType::Batch,
+            input: vec![7, 8, 9],
+            output: vec![10, 11, 12],
+            config: serde_json::Value::Null,
+        };
+
+        storage.store_request(&request).await.unwrap();
+
+        let preparing = storage.get_preparing_requests().await.unwrap();
+        assert_eq!(preparing.len(), 1);
+        assert_eq!(preparing[0].output, request.output);
+    }
+
+    #[tokio::test]
+    async fn get_request_by_input_hash_includes_output_column() {
+        let db_path = temp_db_path();
+        let storage = RequestStorage::new(db_path.clone());
+        storage.initialize().await.unwrap();
+
+        let request = AsyncProofRequest {
+            request_id: "req_dedup".to_string(),
+            prover_type: ProverType::Boundless,
+            provider_request_id: None,
+            status: ProofRequestStatus::Preparing,
+            proof_type: ProofType::Batch,
+            input: vec![42, 43, 44],
+            output: vec![10, 11, 12],
+            config: serde_json::Value::Null,
+        };
+
+        storage.store_request(&request).await.unwrap();
+
+        let fetched = storage
+            .get_request_by_input_hash(&request.input, &request.proof_type, &request.prover_type)
+            .await
+            .unwrap();
+        let fetched = fetched.expect("expected stored request");
+        assert_eq!(fetched.output, request.output);
+        assert_eq!(fetched.request_id, request.request_id);
     }
 }
