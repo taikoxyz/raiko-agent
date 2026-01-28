@@ -82,17 +82,19 @@ The service requires a Boundless JSON config via `--config-file` (no merge). Exa
   },
   "offer_params": {
     "batch": {
-      "ramp_up_sec": 300,
-      "lock_timeout_ms_per_mcycle": 400,
-      "timeout_ms_per_mcycle": 900,
+      "ramp_up_start_sec": 30,
+      "ramp_up_period_blocks": 15,
+      "lock_timeout_ms_per_mcycle": 90,
+      "timeout_ms_per_mcycle": 215,
       "max_price_per_mcycle": "0.000000085",
       "min_price_per_mcycle": "0.000000005",
       "lock_collateral": "15"
     },
     "aggregation": {
-      "ramp_up_sec": 60,
-      "lock_timeout_ms_per_mcycle": 3300,
-      "timeout_ms_per_mcycle": 6000,
+      "ramp_up_start_sec": 30,
+      "ramp_up_period_blocks": 15,
+      "lock_timeout_ms_per_mcycle": 1500,
+      "timeout_ms_per_mcycle": 4500,
       "max_price_per_mcycle": "0.00000006",
       "min_price_per_mcycle": "0.000000006",
       "lock_collateral": "15"
@@ -104,6 +106,19 @@ The service requires a Boundless JSON config via `--config-file` (no merge). Exa
 
 `deployment` and `rpc_url` are optional; `offer_params.batch` and `offer_params.aggregation`
 are required.
+
+### Offer Params Guidance
+
+- `ramp_up_start_sec`: delay (seconds) after request creation before bidding starts.
+- `ramp_up_period_blocks`: ramp-up duration in **blocks** (Base uses ~2s/block). Ensure `ramp_up_period_blocks * block_time_sec <= (lock_timeout_ms_per_mcycle * mcycles / 1000)` so ramp-up finishes before the lock timeout elapses.
+- `lock_timeout_ms_per_mcycle`: lock timeout in **milliseconds per million cycles**; total lock timeout in seconds is `lock_timeout_ms_per_mcycle * mcycles / 1000`. The primary prover must fulfill by this time.
+- `timeout_ms_per_mcycle`: request expiry in **milliseconds per million cycles**; total expiry time in seconds is `timeout_ms_per_mcycle * mcycles / 1000`. This total expiry must be greater than the total lock timeout (i.e., use `timeout_ms_per_mcycle` > `lock_timeout_ms_per_mcycle` for the same workload).
+- `max_price_per_mcycle` / `min_price_per_mcycle`: per‑mcycle price bounds; min defaults to 0 if omitted.
+- `lock_collateral`: fixed ZKC amount (explicitly configured; not derived from price).
+
+Example targets used in configs (assuming ~7B cycles for batch, ~200M for aggregation):
+- Batch: lock ~10 min, timeout ~25 min → 90 / 215 ms_per_mcycle
+- Aggregation: lock ~5 min, timeout ~15 min → 1500 / 4500 ms_per_mcycle
 
 ## Environment Variables
 

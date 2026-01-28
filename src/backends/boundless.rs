@@ -133,11 +133,13 @@ pub struct Risc0Response {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BoundlessOfferParams {
-    pub ramp_up_sec: u32,
+    pub ramp_up_start_sec: u32,
+    pub ramp_up_period_blocks: u32,
     pub lock_timeout_ms_per_mcycle: u32,
     pub timeout_ms_per_mcycle: u32,
     pub max_price_per_mcycle: String,
-    pub min_price_per_mcycle: String,
+    #[serde(default)]
+    pub min_price_per_mcycle: Option<String>,
     pub lock_collateral: String,
 }
 
@@ -202,6 +204,13 @@ impl BoundlessConfig {
     /// Get the effective aggregation offer params
     pub fn get_aggregation_offer_params(&self) -> BoundlessOfferParams {
         self.offer_params.aggregation.clone()
+    }
+
+    pub fn block_time_sec(&self) -> u32 {
+        match self.get_deployment_type() {
+            DeploymentType::Base => 2,
+            DeploymentType::Sepolia => 12,
+        }
     }
 }
 
@@ -1683,24 +1692,19 @@ impl BoundlessProver {
         let image_id = compute_image_id(program_bytes).map_err(|e| {
             AgentError::ClientBuildError(format!("Failed to compute image_id from program: {e}"))
         })?;
-        let max_price = parse_ether(&offer_spec.max_price_per_mcycle).map_err(|e| {
-            AgentError::ClientBuildError(format!(
-                "Failed to parse max_price_per_mcycle: {} ({})",
-                offer_spec.max_price_per_mcycle, e
-            ))
-        })? * U256::from(mcycles_count);
 
-        // let min_price = parse_ether(&offer_spec.min_price_per_mcycle).map_err(|e| {
-        //     AgentError::ClientBuildError(format!(
-        //         "Failed to parse min_price_per_mcycle: {} ({})",
-        //         offer_spec.min_price_per_mcycle, e
-        //     ))
-        // })? * U256::from(mcycles_count);
-
-        let lock_collateral = parse_staking_token(&offer_spec.lock_collateral)?;
-        let lock_timeout = offer_spec.lock_timeout_ms_per_mcycle * mcycles_count / 1000u32;
-        let timeout = offer_spec.timeout_ms_per_mcycle * mcycles_count / 1000u32;
-        let ramp_up_period = std::cmp::min(offer_spec.ramp_up_sec, lock_timeout);
+        let block_time_sec = self.boundless_config.block_time_sec();
+        let validated = validate_offer_params(offer_spec, mcycles_count, block_time_sec)?;
+        tracing::info!(
+            "Derived offer params: lock_timeout={}s timeout={}s ramp_up_period_blocks={} bidding_start={} max_price={} min_price={} lock_collateral={}",
+            validated.lock_timeout,
+            validated.timeout,
+            validated.ramp_up_period,
+            validated.bidding_start,
+            validated.max_price,
+            validated.min_price,
+            validated.lock_collateral
+        );
 
         let mut request_params = boundless_client
             .new_request()
@@ -1714,19 +1718,13 @@ impl BoundlessProver {
             .with_journal(Journal::new(journal))
             .with_offer(
                 OfferParams::builder()
-                    .ramp_up_period(ramp_up_period)
-                    .lock_timeout(lock_timeout)
-                    .timeout(timeout)
-                    .max_price(max_price)
-                    // .min_price(min_price)
-                    .lock_collateral(lock_collateral)
-                    .bidding_start(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs()
-                            + 60,
-                    ),
+                    .ramp_up_period(validated.ramp_up_period)
+                    .lock_timeout(validated.lock_timeout)
+                    .timeout(validated.timeout)
+                    .max_price(validated.max_price)
+                    .min_price(validated.min_price)
+                    .lock_collateral(validated.lock_collateral)
+                    .bidding_start(validated.bidding_start),
             );
 
         if let Some(url) = input_url {
@@ -1745,6 +1743,79 @@ impl BoundlessProver {
 
         Ok(request)
     }
+}
+
+#[derive(Debug)]
+struct ValidatedOfferParams {
+    max_price: U256,
+    min_price: U256,
+    lock_collateral: U256,
+    lock_timeout: u32,
+    timeout: u32,
+    ramp_up_period: u32,
+    bidding_start: u64,
+}
+
+fn validate_offer_params(
+    offer_spec: &BoundlessOfferParams,
+    mcycles_count: u32,
+    block_time_sec: u32,
+) -> AgentResult<ValidatedOfferParams> {
+    let max_price = parse_ether(&offer_spec.max_price_per_mcycle).map_err(|e| {
+        AgentError::ClientBuildError(format!(
+            "Failed to parse max_price_per_mcycle: {} ({})",
+            offer_spec.max_price_per_mcycle, e
+        ))
+    })? * U256::from(mcycles_count);
+
+    let min_price_value = offer_spec.min_price_per_mcycle.as_deref().unwrap_or("0");
+    let min_price = parse_ether(min_price_value).map_err(|e| {
+        AgentError::ClientBuildError(format!(
+            "Failed to parse min_price_per_mcycle: {} ({})",
+            min_price_value, e
+        ))
+    })? * U256::from(mcycles_count);
+
+    if min_price > max_price {
+        return Err(AgentError::RequestBuildError(
+            "min_price_per_mcycle cannot exceed max_price_per_mcycle".to_string(),
+        ));
+    }
+
+    let lock_collateral = parse_staking_token(&offer_spec.lock_collateral)?;
+    let lock_timeout = offer_spec.lock_timeout_ms_per_mcycle * mcycles_count / 1000u32;
+    let timeout = offer_spec.timeout_ms_per_mcycle * mcycles_count / 1000u32;
+
+    if timeout <= lock_timeout {
+        return Err(AgentError::RequestBuildError(
+            "timeout must be greater than lock_timeout".to_string(),
+        ));
+    }
+
+    let ramp_up_period = offer_spec.ramp_up_period_blocks;
+    let ramp_up_seconds = ramp_up_period.saturating_mul(block_time_sec);
+    if ramp_up_seconds > lock_timeout {
+        return Err(AgentError::RequestBuildError(format!(
+            "ramp_up_period_seconds ({}) (ramp_up_period_blocks: {}, block_time_sec: {}) exceeds lock_timeout_seconds ({})",
+            ramp_up_seconds, ramp_up_period, block_time_sec, lock_timeout
+        )));
+    }
+
+    let bidding_start = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + offer_spec.ramp_up_start_sec as u64;
+
+    Ok(ValidatedOfferParams {
+        max_price,
+        min_price,
+        lock_collateral,
+        lock_timeout,
+        timeout,
+        ramp_up_period,
+        bidding_start,
+    })
 }
 
 #[cfg(test)]
@@ -1771,22 +1842,24 @@ mod tests {
 
     fn test_batch_offer_params() -> BoundlessOfferParams {
         BoundlessOfferParams {
-            ramp_up_sec: 1000,
-            lock_timeout_ms_per_mcycle: 5000,
-            timeout_ms_per_mcycle: 3600 * 3,
+            ramp_up_start_sec: 30,
+            ramp_up_period_blocks: 15,
+            lock_timeout_ms_per_mcycle: 90,
+            timeout_ms_per_mcycle: 215,
             max_price_per_mcycle: "0.00003".to_string(),
-            min_price_per_mcycle: "0.000005".to_string(),
+            min_price_per_mcycle: Some("0.000005".to_string()),
             lock_collateral: "0.0001".to_string(),
         }
     }
 
     fn test_aggregation_offer_params() -> BoundlessOfferParams {
         BoundlessOfferParams {
-            ramp_up_sec: 200,
-            lock_timeout_ms_per_mcycle: 1000,
-            timeout_ms_per_mcycle: 3000,
+            ramp_up_start_sec: 30,
+            ramp_up_period_blocks: 15,
+            lock_timeout_ms_per_mcycle: 1500,
+            timeout_ms_per_mcycle: 4500,
             max_price_per_mcycle: "0.00001".to_string(),
-            min_price_per_mcycle: "0.000003".to_string(),
+            min_price_per_mcycle: Some("0.000003".to_string()),
             lock_collateral: "0.0001".to_string(),
         }
     }
@@ -2162,16 +2235,54 @@ mod tests {
         // 0.00003 * 1000 = 0.03 ETH
         assert_eq!(max_price, U256::from(30000000000000000u128));
 
-        let min_price_per_mcycle = parse_ether(&offer_params.min_price_per_mcycle)
-            .expect("Failed to parse min_price_per_mcycle");
+        let min_price_per_mcycle =
+            parse_ether(offer_params.min_price_per_mcycle.as_deref().unwrap_or("0"))
+                .expect("Failed to parse min_price_per_mcycle");
         let min_price = min_price_per_mcycle * U256::from(1000u64);
-        // 0.000005 * 1000 = 0.005 ETH
-        assert_eq!(min_price, U256::from(5000000000000000u128));
+        assert!(min_price <= max_price);
 
         let lock_collateral_per_mcycle = parse_staking_token(&offer_params.lock_collateral)
             .expect("Failed to parse lock_collateral_per_mcycle");
         let lock_collateral = lock_collateral_per_mcycle * U256::from(1000u64);
         // 0.0001 * 1000 = 0.1 USDC
         assert_eq!(lock_collateral, U256::from(100000000000000000u64));
+    }
+
+    #[test]
+    fn validate_offer_params_rejects_min_gt_max() {
+        let mut offer_params = test_batch_offer_params();
+        offer_params.min_price_per_mcycle = Some("0.0001".to_string());
+        offer_params.max_price_per_mcycle = "0.00001".to_string();
+
+        let result = validate_offer_params(&offer_params, 7000, 2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_offer_params_rejects_timeout_le_lock_timeout() {
+        let mut offer_params = test_batch_offer_params();
+        offer_params.lock_timeout_ms_per_mcycle = 200;
+        offer_params.timeout_ms_per_mcycle = 100;
+
+        let result = validate_offer_params(&offer_params, 7000, 2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_offer_params_rejects_ramp_up_too_long() {
+        let mut offer_params = test_batch_offer_params();
+        offer_params.ramp_up_period_blocks = 400;
+        offer_params.lock_timeout_ms_per_mcycle = 100;
+        offer_params.timeout_ms_per_mcycle = 200;
+
+        let result = validate_offer_params(&offer_params, 7000, 2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_offer_params_accepts_valid_config() {
+        let offer_params = test_batch_offer_params();
+        let result = validate_offer_params(&offer_params, 7000, 2);
+        assert!(result.is_ok());
     }
 }
