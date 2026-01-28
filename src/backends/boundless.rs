@@ -69,6 +69,14 @@ const MILLION_CYCLES: u64 = 1_000_000;
 const STAKE_TOKEN_DECIMALS: u8 = 18;
 const MAX_SUBMISSION_ATTEMPTS: u32 = 5;
 
+fn resubmit_plan(proof_type: &ProofType) -> Option<(ElfType, ProofType)> {
+    match proof_type {
+        ProofType::Batch => Some((ElfType::Batch, ProofType::Batch)),
+        ProofType::Aggregate => Some((ElfType::Aggregation, ProofType::Aggregate)),
+        ProofType::Update(_) => None,
+    }
+}
+
 fn parse_provider_request_id(provider_request_id: &str) -> Option<U256> {
     let trimmed = provider_request_id.trim_start_matches("0x");
     U256::from_str_radix(trimmed, 16).ok()
@@ -911,16 +919,12 @@ impl BoundlessProver {
                 continue;
             }
 
-            let (elf_type, proof_type) = match request.proof_type {
-                ProofType::Batch => (ElfType::Batch, ProofType::Batch),
-                ProofType::Aggregate => (ElfType::Aggregation, ProofType::Aggregate),
-                ProofType::Update(_) => {
-                    tracing::warn!(
-                        "Skipping resubmit for update request {}",
-                        request.request_id
-                    );
-                    continue;
-                }
+            let Some((elf_type, proof_type)) = resubmit_plan(&request.proof_type) else {
+                tracing::warn!(
+                    "Skipping resubmit for update request {}",
+                    request.request_id
+                );
+                continue;
             };
 
             let image_info = match self
@@ -2427,5 +2431,18 @@ mod tests {
         let offer_params = test_batch_offer_params();
         let result = validate_offer_params(&offer_params, 7000, 2);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn resubmit_plan_maps_proof_type() {
+        assert!(resubmit_plan(&ProofType::Update(ElfType::Batch)).is_none());
+
+        let (elf_type, proof_type) = resubmit_plan(&ProofType::Batch).unwrap();
+        assert!(matches!(elf_type, ElfType::Batch));
+        assert!(matches!(proof_type, ProofType::Batch));
+
+        let (elf_type, proof_type) = resubmit_plan(&ProofType::Aggregate).unwrap();
+        assert!(matches!(elf_type, ElfType::Aggregation));
+        assert!(matches!(proof_type, ProofType::Aggregate));
     }
 }
