@@ -643,16 +643,16 @@ impl RequestStorage {
 
         self.open_with_pragmas()
             .await?
-            .call(move |conn| {
-                Self::apply_pragmas(conn)?;
-                let mut stmt = conn.prepare(
-                    r#"
-                    SELECT request_id, prover_type, provider_request_id, status, proof_type, input_data, config_data
-                    FROM proof_requests
-                    WHERE input_hash = ?1 AND proof_type_str = ?2 AND prover_type = ?3
-                    ORDER BY updated_at DESC
-                    LIMIT 1
-                    "#
+	            .call(move |conn| {
+	                Self::apply_pragmas(conn)?;
+	                let mut stmt = conn.prepare(
+	                    r#"
+	                    SELECT request_id, prover_type, provider_request_id, status, proof_type, input_data, output_data, config_data
+	                    FROM proof_requests
+	                    WHERE input_hash = ?1 AND proof_type_str = ?2 AND prover_type = ?3
+	                    ORDER BY updated_at DESC
+	                    LIMIT 1
+	                    "#
                 )?;
 
                 let mut rows = stmt.query_map([input_hash, proof_type_str, prover_type_str], |row| {
@@ -1318,5 +1318,33 @@ mod tests {
         let preparing = storage.get_preparing_requests().await.unwrap();
         assert_eq!(preparing.len(), 1);
         assert_eq!(preparing[0].output, request.output);
+    }
+
+    #[tokio::test]
+    async fn get_request_by_input_hash_includes_output_column() {
+        let db_path = temp_db_path();
+        let storage = RequestStorage::new(db_path.clone());
+        storage.initialize().await.unwrap();
+
+        let request = AsyncProofRequest {
+            request_id: "req_dedup".to_string(),
+            prover_type: ProverType::Boundless,
+            provider_request_id: None,
+            status: ProofRequestStatus::Preparing,
+            proof_type: ProofType::Batch,
+            input: vec![42, 43, 44],
+            output: vec![10, 11, 12],
+            config: serde_json::Value::Null,
+        };
+
+        storage.store_request(&request).await.unwrap();
+
+        let fetched = storage
+            .get_request_by_input_hash(&request.input, &request.proof_type, &request.prover_type)
+            .await
+            .unwrap();
+        let fetched = fetched.expect("expected stored request");
+        assert_eq!(fetched.output, request.output);
+        assert_eq!(fetched.request_id, request.request_id);
     }
 }
