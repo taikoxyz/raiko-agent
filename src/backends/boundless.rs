@@ -297,7 +297,15 @@ impl BoundlessProver {
         boundless_client: &Client,
         request: ProofRequest,
     ) -> AgentResult<U256> {
-        // Send the request to the market with retry logic
+        // IMPORTANT:
+        // - Offchain submissions are safe to retry (no gas cost).
+        // - Onchain submissions may broadcast a transaction that succeeds even if the client
+        //   doesn't observe the success (timeout/network error). Blind retries can therefore
+        //   lead to multiple transactions and unnecessary gas spend.
+        //
+        // For now we intentionally DO NOT retry onchain submission. If you want retries,
+        // implement an idempotent strategy (e.g. persist tx hash / request_id and verify
+        // onchain state before resubmitting).
         let request_id = if self.config.offchain {
             tracing::info!(
                 "Submitting request offchain to {:?}",
@@ -321,22 +329,13 @@ impl BoundlessProver {
             .await?
             .0
         } else {
-            retry_with_backoff(
-                "submit_request_onchain",
-                || async {
-                    boundless_client
-                        .submit_request_onchain(&request)
-                        .await
-                        .map_err(|e| {
-                            AgentError::RequestSubmitError(format!(
-                                "Failed to submit request onchain: {e}"
-                            ))
-                        })
-                },
-                MAX_RETRY_ATTEMPTS,
-            )
-            .await?
-            .0
+            boundless_client
+                .submit_request_onchain(&request)
+                .await
+                .map_err(|e| {
+                    AgentError::RequestSubmitError(format!("Failed to submit request onchain: {e}"))
+                })?
+                .0
         };
 
         let request_id_str = format!("0x{:x}", request_id);
@@ -1310,6 +1309,7 @@ impl BoundlessProver {
         let request = self
             .build_boundless_request(
                 &boundless_client,
+                request_id,
                 image_url,
                 elf,
                 input_url,
@@ -1324,39 +1324,55 @@ impl BoundlessProver {
             })?;
         let expires_at = request.expires_at();
 
-        // Submit to market
-        let market_request_id = self
-            .submit_request_async(&boundless_client, request)
-            .await
-            .map_err(|e| {
-                AgentError::RequestSubmitError(format!("Failed to submit to market: {}", e))
-            })?;
-        let provider_request_id = format!("0x{:x}", market_request_id);
-
-        // Update the stored request with new provider_request_id
-        {
-            let mut requests_guard = active_requests.write().await;
-            if let Some(async_req) = requests_guard.get_mut(request_id) {
-                async_req.provider_request_id = Some(provider_request_id.clone());
-                async_req.status = ProofRequestStatus::Submitted {
-                    provider_request_id: provider_request_id.clone(),
-                    expires_at: Some(expires_at),
-                };
-            }
-        }
-
-        // Update in SQLite storage with correct provider_request_id
-        let submitted_status = ProofRequestStatus::Submitted {
-            provider_request_id,
+        // Idempotency / recovery note:
+        // `boundless_market::Client::submit_request_onchain()` waits for a receipt and then extracts
+        // the RequestSubmitted log to return the request id. If the tx is broadcast but the caller
+        // fails to observe the receipt/log (RPC timeout, restart, etc.), naive retries can submit
+        // multiple transactions.
+        //
+        // To avoid "tx went through but we didn't see the event -> resubmit", we force the market
+        // request id to be deterministic from our service-level request_id, and persist it BEFORE
+        // submitting. Then, even if submission returns an error, we can resume by polling market
+        // status using this known id rather than resubmitting.
+        let provider_request_id = format!("0x{:x}", request.id);
+        let pre_submitted_status = ProofRequestStatus::Submitted {
+            provider_request_id: provider_request_id.clone(),
             expires_at: Some(expires_at),
         };
-        if let Err(e) = self
-            .storage
-            .update_status(request_id, &submitted_status)
-            .await
-        {
-            tracing::warn!("Failed to update provider request ID in storage: {}", e);
-        }
+        // Best-effort persist "submitted" early for recovery; if submission truly failed,
+        // polling will eventually time out and mark the request as Failed.
+        let _ = self
+            .update_request_status(request_id, pre_submitted_status, &active_requests)
+            .await;
+
+        // Submit to market
+        let market_request_id = if self.config.offchain {
+            // Offchain is safe to fail fast; caller can retry without gas risk.
+            self.submit_request_async(&boundless_client, request)
+                .await
+                .map_err(|e| {
+                    AgentError::RequestSubmitError(format!("Failed to submit offchain: {}", e))
+                })?
+        } else {
+            // Onchain submission might have broadcast a tx even if we don't observe confirmation.
+            // If submission returns an error, do NOT resubmit here; continue with status polling.
+            let precomputed_id = request.id;
+            match self
+                .submit_request_async(&boundless_client, request.clone())
+                .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(
+                        "Onchain submit returned error for {} (will poll using precomputed id {}): {}",
+                        request_id,
+                        provider_request_id,
+                        e
+                    );
+                    precomputed_id
+                }
+            }
+        };
 
         // Start polling market status in background
         self.start_status_polling(request_id, market_request_id, proof_type, active_requests)
@@ -1841,6 +1857,7 @@ impl BoundlessProver {
     async fn build_boundless_request(
         &self,
         boundless_client: &Client,
+        request_id: &str,
         program_url: Url,
         program_bytes: &[u8],
         input_url: Option<Url>,
@@ -1896,10 +1913,20 @@ impl BoundlessProver {
         }
 
         // Build the request, including preflight, and assigned the remaining fields.
-        let request = boundless_client
+        let mut request = boundless_client
             .build_request(request_params)
             .await
             .map_err(|e| AgentError::ClientBuildError(format!("Failed to build request: {e:?}")))?;
+
+        // Force a deterministic market request id from our service-level request_id.
+        // This enables crash-safe recovery / polling without requiring a tx hash.
+        let id_hash = alloy_primitives_v1p2p0::keccak256(request_id.as_bytes());
+        let id_hex = alloy_primitives_v1p2p0::hex::encode(id_hash);
+        if let Ok(id) = U256::from_str_radix(&id_hex, 16) {
+            if id != U256::ZERO {
+                request.id = id;
+            }
+        }
         tracing::info!("Request: {:?}", request);
 
         Ok(request)
