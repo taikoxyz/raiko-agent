@@ -855,6 +855,17 @@ impl BoundlessProver {
         true
     }
 
+    /// Ensures the given request is in the in-memory cache so idempotent lookups see it.
+    async fn ensure_request_in_cache(&self, existing_request: &AsyncProofRequest) {
+        let mut requests_guard = self.active_requests.write().await;
+        if !requests_guard.contains_key(&existing_request.request_id) {
+            requests_guard.insert(
+                existing_request.request_id.clone(),
+                existing_request.clone(),
+            );
+        }
+    }
+
     async fn resume_pending_requests(&self) {
         let pending = match self.storage.get_pending_requests().await {
             Ok(requests) => requests,
@@ -1338,7 +1349,6 @@ impl BoundlessProver {
         // To avoid "tx went through but we didn't see the event -> resubmit", we force the market
         // request id to be deterministic from our service-level request_id.
         let provider_request_id = format!("0x{:x}", request.id);
-        let precomputed_id = request.id;
         if !self.config.offchain {
             // Onchain submission can be ambiguous (tx broadcast but caller didn't observe receipt).
             // Persist an intermediate status so restarts can resume polling without resubmitting.
@@ -1372,6 +1382,7 @@ impl BoundlessProver {
         } else {
             // Onchain submission might have broadcast a tx even if we don't observe confirmation.
             // If submission returns an error, do NOT resubmit here; continue with status polling.
+            let precomputed_id = request.id;
             match self.submit_request_async(&boundless_client, request).await {
                 Ok(id) => {
                     // Onchain: move from Submitting -> Submitted once the submit call completed.
@@ -1423,75 +1434,39 @@ impl BoundlessProver {
                         "Returning existing request in preparation phase for request: {}",
                         existing_request.request_id
                     );
-                    // Add to memory cache if not already there
-                    {
-                        let mut requests_guard = self.active_requests.write().await;
-                        if !requests_guard.contains_key(&existing_request.request_id) {
-                            requests_guard.insert(
-                                existing_request.request_id.clone(),
-                                existing_request.clone(),
-                            );
-                        }
-                    }
-                    return Ok(existing_request.request_id);
+                    self.ensure_request_in_cache(&existing_request).await;
+                    return Ok(existing_request.request_id.clone());
                 }
                 ProofRequestStatus::Fulfilled { .. } => {
                     tracing::info!(
                         "Returning existing completed batch proof for request: {}",
                         existing_request.request_id
                     );
-                    return Ok(existing_request.request_id);
+                    return Ok(existing_request.request_id.clone());
                 }
                 ProofRequestStatus::Submitting { .. } => {
                     tracing::info!(
                         "Returning existing submitting batch proof (pre-submit persisted) for request: {}",
                         existing_request.request_id
                     );
-                    // Add to memory cache if not already there
-                    {
-                        let mut requests_guard = self.active_requests.write().await;
-                        if !requests_guard.contains_key(&existing_request.request_id) {
-                            requests_guard.insert(
-                                existing_request.request_id.clone(),
-                                existing_request.clone(),
-                            );
-                        }
-                    }
-                    return Ok(existing_request.request_id);
+                    self.ensure_request_in_cache(&existing_request).await;
+                    return Ok(existing_request.request_id.clone());
                 }
                 ProofRequestStatus::Submitted { .. } => {
                     tracing::info!(
                         "Returning existing submitted batch proof (waiting for prover) for request: {}",
                         existing_request.request_id
                     );
-                    // Add to memory cache if not already there
-                    {
-                        let mut requests_guard = self.active_requests.write().await;
-                        if !requests_guard.contains_key(&existing_request.request_id) {
-                            requests_guard.insert(
-                                existing_request.request_id.clone(),
-                                existing_request.clone(),
-                            );
-                        }
-                    }
-                    return Ok(existing_request.request_id);
+                    self.ensure_request_in_cache(&existing_request).await;
+                    return Ok(existing_request.request_id.clone());
                 }
                 ProofRequestStatus::Locked { .. } => {
                     tracing::info!(
                         "Returning existing locked batch proof (being processed by prover) for request: {}",
                         existing_request.request_id
                     );
-                    // Add to memory cache if not already there
-                    {
-                        let mut requests_guard = self.active_requests.write().await;
-                        if !requests_guard.contains_key(&existing_request.request_id) {
-                            requests_guard.insert(
-                                existing_request.request_id.clone(),
-                                existing_request.clone(),
-                            );
-                        }
-                    }
-                    return Ok(existing_request.request_id);
+                    self.ensure_request_in_cache(&existing_request).await;
+                    return Ok(existing_request.request_id.clone());
                 }
                 ProofRequestStatus::Failed { error } => {
                     tracing::info!(
@@ -1591,75 +1566,39 @@ impl BoundlessProver {
                         "Returning existing request in preparation phase for request: {}",
                         existing_request.request_id
                     );
-                    // Add to memory cache if not already there
-                    {
-                        let mut requests_guard = self.active_requests.write().await;
-                        if !requests_guard.contains_key(&existing_request.request_id) {
-                            requests_guard.insert(
-                                existing_request.request_id.clone(),
-                                existing_request.clone(),
-                            );
-                        }
-                    }
-                    return Ok(existing_request.request_id);
+                    self.ensure_request_in_cache(&existing_request).await;
+                    return Ok(existing_request.request_id.clone());
                 }
                 ProofRequestStatus::Fulfilled { .. } => {
                     tracing::info!(
                         "Returning existing completed aggregation proof for request: {}",
                         existing_request.request_id
                     );
-                    return Ok(existing_request.request_id);
+                    return Ok(existing_request.request_id.clone());
                 }
                 ProofRequestStatus::Submitting { .. } => {
                     tracing::info!(
                         "Returning existing submitting aggregation proof (pre-submit persisted) for request: {}",
                         existing_request.request_id
                     );
-                    // Add to memory cache if not already there
-                    {
-                        let mut requests_guard = self.active_requests.write().await;
-                        if !requests_guard.contains_key(&existing_request.request_id) {
-                            requests_guard.insert(
-                                existing_request.request_id.clone(),
-                                existing_request.clone(),
-                            );
-                        }
-                    }
-                    return Ok(existing_request.request_id);
+                    self.ensure_request_in_cache(&existing_request).await;
+                    return Ok(existing_request.request_id.clone());
                 }
                 ProofRequestStatus::Submitted { .. } => {
                     tracing::info!(
                         "Returning existing submitted aggregation proof (waiting for prover) for request: {}",
                         existing_request.request_id
                     );
-                    // Add to memory cache if not already there
-                    {
-                        let mut requests_guard = self.active_requests.write().await;
-                        if !requests_guard.contains_key(&existing_request.request_id) {
-                            requests_guard.insert(
-                                existing_request.request_id.clone(),
-                                existing_request.clone(),
-                            );
-                        }
-                    }
-                    return Ok(existing_request.request_id);
+                    self.ensure_request_in_cache(&existing_request).await;
+                    return Ok(existing_request.request_id.clone());
                 }
                 ProofRequestStatus::Locked { .. } => {
                     tracing::info!(
                         "Returning existing locked aggregation proof (being processed by prover) for request: {}",
                         existing_request.request_id
                     );
-                    // Add to memory cache if not already there
-                    {
-                        let mut requests_guard = self.active_requests.write().await;
-                        if !requests_guard.contains_key(&existing_request.request_id) {
-                            requests_guard.insert(
-                                existing_request.request_id.clone(),
-                                existing_request.clone(),
-                            );
-                        }
-                    }
-                    return Ok(existing_request.request_id);
+                    self.ensure_request_in_cache(&existing_request).await;
+                    return Ok(existing_request.request_id.clone());
                 }
                 ProofRequestStatus::Failed { error } => {
                     tracing::info!(
