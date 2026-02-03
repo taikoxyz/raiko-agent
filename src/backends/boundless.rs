@@ -1354,7 +1354,8 @@ impl BoundlessProver {
         // Submit to market
         let market_request_id = if self.config.offchain {
             // Offchain is safe to fail fast; caller can retry without gas risk.
-            let id = self.submit_request_async(&boundless_client, request)
+            let id = self
+                .submit_request_async(&boundless_client, request)
                 .await
                 .map_err(|e| {
                     AgentError::RequestSubmitError(format!("Failed to submit offchain: {}", e))
