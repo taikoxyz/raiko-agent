@@ -1358,7 +1358,7 @@ impl BoundlessProver {
             // If submission returns an error, do NOT resubmit here; continue with status polling.
             let precomputed_id = request.id;
             match self
-                .submit_request_async(&boundless_client, request.clone())
+                .submit_request_async(&boundless_client, request)
                 .await
             {
                 Ok(id) => id,
