@@ -1063,25 +1063,25 @@ impl BoundlessProver {
             // If we have a tx_hash, assume the tx was broadcast and resume polling. If the receipt
             // is already known and reverted, fail fast.
             if let Some(tx_hash) = tx_hash.as_deref() {
-                if let Some(tx_hash) = parse_tx_hash(tx_hash) {
-                    if let Ok(boundless_client) = self.create_boundless_client().await {
-                        match boundless_client
-                            .boundless_market
-                            .instance()
-                            .provider()
-                            .get_transaction_receipt(tx_hash)
-                            .await
-                        {
-                            Ok(Some(receipt)) if !receipt.status() => {
-                                self.update_failed_status(
-                                    &request.request_id,
-                                    "Onchain submit transaction reverted".to_string(),
-                                )
-                                .await;
-                                continue;
-                            }
-                            Ok(_) | Err(_) => {}
+                if let Some(parsed_tx_hash) = parse_tx_hash(tx_hash)
+                    && let Ok(boundless_client) = self.create_boundless_client().await
+                {
+                    match boundless_client
+                        .boundless_market
+                        .instance()
+                        .provider()
+                        .get_transaction_receipt(parsed_tx_hash)
+                        .await
+                    {
+                        Ok(Some(receipt)) if !receipt.status() => {
+                            self.update_failed_status(
+                                &request.request_id,
+                                "Onchain submit transaction reverted".to_string(),
+                            )
+                            .await;
+                            continue;
                         }
+                        Ok(_) | Err(_) => {}
                     }
                 }
 
@@ -1645,10 +1645,8 @@ impl BoundlessProver {
                 AgentError::RequestBuildError(format!("Failed to build request: {}", e))
             })?;
 
-        if let Some(forced_id) = forced_market_request_id {
-            if forced_id != U256::ZERO {
-                request.id = forced_id;
-            }
+        if let Some(forced_id) = forced_market_request_id && forced_id != U256::ZERO {
+            request.id = forced_id;
         }
         let expires_at = request.expires_at();
 
