@@ -1357,10 +1357,7 @@ impl BoundlessProver {
             // Onchain submission might have broadcast a tx even if we don't observe confirmation.
             // If submission returns an error, do NOT resubmit here; continue with status polling.
             let precomputed_id = request.id;
-            match self
-                .submit_request_async(&boundless_client, request)
-                .await
-            {
+            match self.submit_request_async(&boundless_client, request).await {
                 Ok(id) => id,
                 Err(e) => {
                     tracing::warn!(
@@ -1921,11 +1918,9 @@ impl BoundlessProver {
         // Force a deterministic market request id from our service-level request_id.
         // This enables crash-safe recovery / polling without requiring a tx hash.
         let id_hash = alloy_primitives_v1p2p0::keccak256(request_id.as_bytes());
-        let id_hex = alloy_primitives_v1p2p0::hex::encode(id_hash);
-        if let Ok(id) = U256::from_str_radix(&id_hex, 16) {
-            if id != U256::ZERO {
-                request.id = id;
-            }
+        let id = U256::from_be_bytes(id_hash.0);
+        if id != U256::ZERO {
+            request.id = id;
         }
         tracing::info!("Request: {:?}", request);
 
