@@ -196,6 +196,7 @@ impl RequestStorage {
     fn status_code(status: &ProofRequestStatus) -> &'static str {
         match status {
             ProofRequestStatus::Preparing => "preparing",
+            ProofRequestStatus::Submitting { .. } => "submitting",
             ProofRequestStatus::Submitted { .. } => "submitted",
             ProofRequestStatus::Locked { .. } => "locked",
             ProofRequestStatus::Fulfilled { .. } => "fulfilled",
@@ -319,7 +320,8 @@ impl RequestStorage {
                     };
 
                     let provider_request_id = match &status {
-                        ProofRequestStatus::Submitted { provider_request_id, .. }
+                        ProofRequestStatus::Submitting { provider_request_id, .. }
+                        | ProofRequestStatus::Submitted { provider_request_id, .. }
                         | ProofRequestStatus::Locked {
                             provider_request_id,
                             ..
@@ -519,8 +521,8 @@ impl RequestStorage {
                         r#"
                     SELECT request_id, prover_type, provider_request_id, status, proof_type, input_data, config_data
                     FROM proof_requests
-                    WHERE (status_code IS NOT NULL AND status_code IN ('submitted','locked'))
-                       OR (status_code IS NULL AND (status LIKE '%Submitted%' OR status LIKE '%Locked%'))
+                    WHERE (status_code IS NOT NULL AND status_code IN ('submitting','submitted','locked'))
+                       OR (status_code IS NULL AND (status LIKE '%Submitting%' OR status LIKE '%Submitted%' OR status LIKE '%Locked%'))
                     ORDER BY updated_at ASC
                     "#,
                     )

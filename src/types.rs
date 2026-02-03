@@ -72,6 +72,15 @@ pub enum ProofType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProofRequestStatus {
     Preparing,
+    /// The request has a known provider_request_id, but submission has not been confirmed yet.
+    ///
+    /// This is used to avoid claiming "submitted" before the actual submit call completes, while
+    /// still persisting enough information to resume polling safely after crashes/restarts.
+    Submitting {
+        provider_request_id: String,
+        /// Unix timestamp (seconds) when the market request expires (if known)
+        expires_at: Option<u64>,
+    },
     Submitted {
         provider_request_id: String,
         /// Unix timestamp (seconds) when the market request expires (if known)

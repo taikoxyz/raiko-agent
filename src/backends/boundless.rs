@@ -1078,7 +1078,11 @@ impl BoundlessProver {
                 async_req.status = status.clone();
                 // Also update provider_request_id field when available in status
                 match &status {
-                    ProofRequestStatus::Submitted {
+                    ProofRequestStatus::Submitting {
+                        provider_request_id,
+                        ..
+                    }
+                    | ProofRequestStatus::Submitted {
                         provider_request_id,
                         ..
                     }
@@ -1130,7 +1134,8 @@ impl BoundlessProver {
             requests_guard
                 .get(request_id)
                 .and_then(|request| match &request.status {
-                    ProofRequestStatus::Submitted { expires_at, .. }
+                    ProofRequestStatus::Submitting { expires_at, .. }
+                    | ProofRequestStatus::Submitted { expires_at, .. }
                     | ProofRequestStatus::Locked { expires_at, .. } => *expires_at,
                     _ => None,
                 })
@@ -1331,34 +1336,53 @@ impl BoundlessProver {
         // multiple transactions.
         //
         // To avoid "tx went through but we didn't see the event -> resubmit", we force the market
-        // request id to be deterministic from our service-level request_id, and persist it BEFORE
-        // submitting. Then, even if submission returns an error, we can resume by polling market
-        // status using this known id rather than resubmitting.
+        // request id to be deterministic from our service-level request_id.
         let provider_request_id = format!("0x{:x}", request.id);
-        let pre_submitted_status = ProofRequestStatus::Submitted {
-            provider_request_id: provider_request_id.clone(),
-            expires_at: Some(expires_at),
-        };
-        // Best-effort persist "submitted" early for recovery; if submission truly failed,
-        // polling will eventually time out and mark the request as Failed.
-        let _ = self
-            .update_request_status(request_id, pre_submitted_status, &active_requests)
-            .await;
+        let precomputed_id = request.id;
+        if !self.config.offchain {
+            // Onchain submission can be ambiguous (tx broadcast but caller didn't observe receipt).
+            // Persist an intermediate status so restarts can resume polling without resubmitting.
+            let submitting_status = ProofRequestStatus::Submitting {
+                provider_request_id: provider_request_id.clone(),
+                expires_at: Some(expires_at),
+            };
+            let _ = self
+                .update_request_status(request_id, submitting_status, &active_requests)
+                .await;
+        }
 
         // Submit to market
         let market_request_id = if self.config.offchain {
             // Offchain is safe to fail fast; caller can retry without gas risk.
-            self.submit_request_async(&boundless_client, request)
+            let id = self.submit_request_async(&boundless_client, request)
                 .await
                 .map_err(|e| {
                     AgentError::RequestSubmitError(format!("Failed to submit offchain: {}", e))
-                })?
+                })?;
+            // Offchain: only mark as submitted after the submit call succeeds.
+            let submitted_status = ProofRequestStatus::Submitted {
+                provider_request_id: provider_request_id.clone(),
+                expires_at: Some(expires_at),
+            };
+            let _ = self
+                .update_request_status(request_id, submitted_status, &active_requests)
+                .await;
+            id
         } else {
             // Onchain submission might have broadcast a tx even if we don't observe confirmation.
             // If submission returns an error, do NOT resubmit here; continue with status polling.
-            let precomputed_id = request.id;
             match self.submit_request_async(&boundless_client, request).await {
-                Ok(id) => id,
+                Ok(id) => {
+                    // Onchain: move from Submitting -> Submitted once the submit call completed.
+                    let submitted_status = ProofRequestStatus::Submitted {
+                        provider_request_id: provider_request_id.clone(),
+                        expires_at: Some(expires_at),
+                    };
+                    let _ = self
+                        .update_request_status(request_id, submitted_status, &active_requests)
+                        .await;
+                    id
+                }
                 Err(e) => {
                     tracing::warn!(
                         "Onchain submit returned error for {} (will poll using precomputed id {}): {}",
@@ -1415,6 +1439,23 @@ impl BoundlessProver {
                         "Returning existing completed batch proof for request: {}",
                         existing_request.request_id
                     );
+                    return Ok(existing_request.request_id);
+                }
+                ProofRequestStatus::Submitting { .. } => {
+                    tracing::info!(
+                        "Returning existing submitting batch proof (pre-submit persisted) for request: {}",
+                        existing_request.request_id
+                    );
+                    // Add to memory cache if not already there
+                    {
+                        let mut requests_guard = self.active_requests.write().await;
+                        if !requests_guard.contains_key(&existing_request.request_id) {
+                            requests_guard.insert(
+                                existing_request.request_id.clone(),
+                                existing_request.clone(),
+                            );
+                        }
+                    }
                     return Ok(existing_request.request_id);
                 }
                 ProofRequestStatus::Submitted { .. } => {
@@ -1566,6 +1607,23 @@ impl BoundlessProver {
                         "Returning existing completed aggregation proof for request: {}",
                         existing_request.request_id
                     );
+                    return Ok(existing_request.request_id);
+                }
+                ProofRequestStatus::Submitting { .. } => {
+                    tracing::info!(
+                        "Returning existing submitting aggregation proof (pre-submit persisted) for request: {}",
+                        existing_request.request_id
+                    );
+                    // Add to memory cache if not already there
+                    {
+                        let mut requests_guard = self.active_requests.write().await;
+                        if !requests_guard.contains_key(&existing_request.request_id) {
+                            requests_guard.insert(
+                                existing_request.request_id.clone(),
+                                existing_request.clone(),
+                            );
+                        }
+                    }
                     return Ok(existing_request.request_id);
                 }
                 ProofRequestStatus::Submitted { .. } => {
