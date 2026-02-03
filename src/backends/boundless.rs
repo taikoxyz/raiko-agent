@@ -1645,7 +1645,9 @@ impl BoundlessProver {
                 AgentError::RequestBuildError(format!("Failed to build request: {}", e))
             })?;
 
-        if let Some(forced_id) = forced_market_request_id && forced_id != U256::ZERO {
+        if let Some(forced_id) = forced_market_request_id
+            && forced_id != U256::ZERO
+        {
             request.id = forced_id;
         }
         let expires_at = request.expires_at();
