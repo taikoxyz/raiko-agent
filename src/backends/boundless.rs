@@ -1325,7 +1325,6 @@ impl BoundlessProver {
         let request = self
             .build_boundless_request(
                 &boundless_client,
-                request_id,
                 image_url,
                 elf,
                 input_url,
@@ -1852,7 +1851,6 @@ impl BoundlessProver {
     async fn build_boundless_request(
         &self,
         boundless_client: &Client,
-        request_id: &str,
         program_url: Url,
         program_bytes: &[u8],
         input_url: Option<Url>,
@@ -1908,18 +1906,10 @@ impl BoundlessProver {
         }
 
         // Build the request, including preflight, and assigned the remaining fields.
-        let mut request = boundless_client
+        let request = boundless_client
             .build_request(request_params)
             .await
             .map_err(|e| AgentError::ClientBuildError(format!("Failed to build request: {e:?}")))?;
-
-        // Force a deterministic market request id from our service-level request_id.
-        // This enables crash-safe recovery / polling without requiring a tx hash.
-        let id_hash = alloy_primitives_v1p2p0::keccak256(request_id.as_bytes());
-        let id = U256::from_be_bytes(id_hash.0);
-        if id != U256::ZERO {
-            request.id = id;
-        }
         tracing::info!("Request: {:?}", request);
 
         Ok(request)
