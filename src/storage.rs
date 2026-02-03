@@ -927,6 +927,39 @@ impl RequestStorage {
             })
     }
 
+    pub async fn get_submitting_requests(&self) -> AgentResult<Vec<AsyncProofRequest>> {
+        self.open_with_pragmas()
+            .await?
+            .call(move |conn| {
+                Self::apply_pragmas(conn)?;
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT request_id, prover_type, provider_request_id, status, proof_type, input_data, output_data, config_data
+                    FROM proof_requests
+                    WHERE (status_code IS NOT NULL AND status_code = 'submitting')
+                       OR (status_code IS NULL AND status LIKE '%Submitting%')
+                    ORDER BY updated_at ASC
+                    "#,
+                )?;
+
+                let rows = stmt.query_map([], Self::parse_request_row)?;
+
+                let mut requests = Vec::new();
+                for row in rows {
+                    match row {
+                        Ok(request) => requests.push(request),
+                        Err(e) => tracing::warn!("Failed to parse submitting request: {}", e),
+                    }
+                }
+
+                Ok(requests)
+            })
+            .await
+            .map_err(|e| {
+                AgentError::ClientBuildError(format!("Failed to get submitting requests: {}", e))
+            })
+    }
+
     pub async fn persist_image(
         &self,
         prover_type: ProverType,

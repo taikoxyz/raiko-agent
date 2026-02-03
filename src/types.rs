@@ -80,6 +80,11 @@ pub enum ProofRequestStatus {
         provider_request_id: String,
         /// Unix timestamp (seconds) when the market request expires (if known)
         expires_at: Option<u64>,
+        /// Onchain submit transaction hash (if available).
+        ///
+        /// This is useful for crash-safe recovery when the submit transaction was broadcast but
+        /// the agent did not observe the receipt/logs (RPC timeout, restart, etc.).
+        tx_hash: Option<String>,
     },
     Submitted {
         provider_request_id: String,

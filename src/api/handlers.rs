@@ -31,7 +31,9 @@ fn map_status_to_api_response(request: &AsyncProofRequest) -> DetailedStatusResp
             None,
         ),
         ProofRequestStatus::Submitting { .. } => (
-            "submitting".to_string(),
+            // Backward-compatible with older clients (e.g. raiko) that only recognize
+            // preparing/submitted/in_progress/completed/failed.
+            "preparing".to_string(),
             "Preparing market submission (provider request ID reserved). Submitting transaction..."
                 .to_string(),
             None,
