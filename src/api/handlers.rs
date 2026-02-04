@@ -30,6 +30,15 @@ fn map_status_to_api_response(request: &AsyncProofRequest) -> DetailedStatusResp
             None,
             None,
         ),
+        ProofRequestStatus::Submitting { .. } => (
+            // Backward-compatible with older clients (e.g. raiko) that only recognize
+            // preparing/submitted/in_progress/completed/failed.
+            "preparing".to_string(),
+            "Preparing market submission (provider request ID reserved). Submitting transaction..."
+                .to_string(),
+            None,
+            None,
+        ),
         ProofRequestStatus::Submitted { .. } => (
             "submitted".to_string(),
             "The proof request has been submitted and is waiting for an available prover to pick it up."
@@ -58,7 +67,11 @@ fn map_status_to_api_response(request: &AsyncProofRequest) -> DetailedStatusResp
     };
 
     let provider_request_id = match &request.status {
-        ProofRequestStatus::Submitted {
+        ProofRequestStatus::Submitting {
+            provider_request_id,
+            ..
+        }
+        | ProofRequestStatus::Submitted {
             provider_request_id,
             ..
         }

@@ -8,7 +8,7 @@ use crate::types::{
     AgentError, AgentResult, AsyncProofRequest, ElfType, ProofRequestStatus, ProofType, ProverType,
 };
 use alloy_primitives_v1p2p0::{
-    U256,
+    B256, U256,
     utils::{parse_ether, parse_units},
 };
 use alloy_signer_local_v1p0p12::PrivateKeySigner;
@@ -28,6 +28,8 @@ use std::sync::OnceLock;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use url::Url;
+
+use boundless_market::alloy::providers::Provider;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DeploymentType {
@@ -91,6 +93,16 @@ fn resubmit_context(
 fn parse_provider_request_id(provider_request_id: &str) -> Option<U256> {
     let trimmed = provider_request_id.trim_start_matches("0x");
     U256::from_str_radix(trimmed, 16).ok()
+}
+
+fn parse_tx_hash(tx_hash: &str) -> Option<B256> {
+    let trimmed = tx_hash.trim_start_matches("0x");
+    if trimmed.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    alloy_primitives_v1p2p0::hex::decode_to_slice(trimmed, &mut bytes).ok()?;
+    Some(B256::from(bytes))
 }
 
 /// Generic retry function with exponential backoff
@@ -297,8 +309,13 @@ impl BoundlessProver {
         boundless_client: &Client,
         request: ProofRequest,
     ) -> AgentResult<U256> {
-        // Send the request to the market with retry logic
-        let request_id = if self.config.offchain {
+        if !self.config.offchain {
+            return Err(AgentError::RequestSubmitError(
+                "submit_request_async called in onchain mode".to_string(),
+            ));
+        }
+
+        let request_id = {
             tracing::info!(
                 "Submitting request offchain to {:?}",
                 &self.deployment.order_stream_url
@@ -320,29 +337,90 @@ impl BoundlessProver {
             )
             .await?
             .0
-        } else {
-            retry_with_backoff(
-                "submit_request_onchain",
-                || async {
-                    boundless_client
-                        .submit_request_onchain(&request)
-                        .await
-                        .map_err(|e| {
-                            AgentError::RequestSubmitError(format!(
-                                "Failed to submit request onchain: {e}"
-                            ))
-                        })
-                },
-                MAX_RETRY_ATTEMPTS,
-            )
-            .await?
-            .0
         };
 
         let request_id_str = format!("0x{:x}", request_id);
         tracing::info!("Request {} submitted successfully", request_id_str);
 
         Ok(request_id)
+    }
+
+    /// Broadcast `submitRequest` onchain and (best-effort) return the tx hash.
+    ///
+    /// Note: transport/RPC errors during `send()` do not reliably prove the tx was *not*
+    /// broadcast. To remain crash-safe, we treat such errors as "broadcast uncertain" and return
+    /// `Ok(None)` so the caller can keep the request in `Submitting` and rely on later
+    /// receipt/event confirmation.
+    async fn submit_request_onchain_with_tx_hash(
+        &self,
+        boundless_client: &Client,
+        request: &ProofRequest,
+    ) -> AgentResult<Option<String>> {
+        let signer = boundless_client.signer.as_ref().ok_or_else(|| {
+            AgentError::RequestSubmitError("boundless client signer missing".into())
+        })?;
+
+        if request.id == U256::ZERO {
+            return Err(AgentError::RequestSubmitError(
+                "request.id is zero; cannot submit onchain".to_string(),
+            ));
+        }
+
+        let client_address = request.client_address();
+        if client_address != signer.address() {
+            return Err(AgentError::RequestSubmitError(format!(
+                "request id address mismatch (request: {}, signer: {})",
+                client_address,
+                signer.address()
+            )));
+        }
+
+        // Mirror BoundlessMarketService::submit_request behavior: top up msg.value if needed.
+        let balance = boundless_client
+            .boundless_market
+            .balance_of(client_address)
+            .await
+            .map_err(|e| {
+                AgentError::RequestSubmitError(format!("Failed to query market balance: {e}"))
+            })?;
+        let max_price = U256::from(request.offer.maxPrice);
+        let value = if balance > max_price {
+            U256::ZERO
+        } else {
+            max_price - balance
+        };
+
+        let chain_id = boundless_client
+            .boundless_market
+            .get_chain_id()
+            .await
+            .map_err(|e| AgentError::RequestSubmitError(format!("Failed to get chain id: {e}")))?;
+        let market_addr = *boundless_client.boundless_market.instance().address();
+        let client_sig = request
+            .sign_request(signer, market_addr, chain_id)
+            .await
+            .map_err(|e| AgentError::RequestSubmitError(format!("Failed to sign request: {e}")))?;
+
+        let call = boundless_client
+            .boundless_market
+            .instance()
+            .submitRequest(request.clone(), client_sig.as_bytes().into())
+            .from(boundless_client.boundless_market.caller())
+            .value(value);
+
+        match call.send().await {
+            Ok(pending_tx) => {
+                let tx_hash = *pending_tx.tx_hash();
+                Ok(Some(format!("0x{:x}", tx_hash)))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "submitRequest send() returned error (broadcast uncertain): {}",
+                    e
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// Check boundless market status and update request tracking
@@ -697,6 +775,7 @@ impl BoundlessProver {
             );
         }
 
+        prover.resume_submitting_requests().await;
         prover.resume_pending_requests().await;
         prover.resume_preparing_requests().await;
 
@@ -856,6 +935,17 @@ impl BoundlessProver {
         true
     }
 
+    /// Ensures the given request is in the in-memory cache so idempotent lookups see it.
+    async fn ensure_request_in_cache(&self, existing_request: &AsyncProofRequest) {
+        let mut requests_guard = self.active_requests.write().await;
+        if !requests_guard.contains_key(&existing_request.request_id) {
+            requests_guard.insert(
+                existing_request.request_id.clone(),
+                existing_request.clone(),
+            );
+        }
+    }
+
     async fn resume_pending_requests(&self) {
         let pending = match self.storage.get_pending_requests().await {
             Ok(requests) => requests,
@@ -912,6 +1002,226 @@ impl BoundlessProver {
                 self.active_requests.clone(),
             )
             .await;
+        }
+    }
+
+    async fn resume_submitting_requests(&self) {
+        if self.config.offchain {
+            return;
+        }
+
+        let submitting = match self.storage.get_submitting_requests().await {
+            Ok(requests) => requests,
+            Err(e) => {
+                tracing::warn!("Failed to load submitting requests for resume: {}", e);
+                return;
+            }
+        };
+
+        if submitting.is_empty() {
+            tracing::info!("No submitting requests to resume");
+            return;
+        }
+
+        tracing::info!("Resuming {} submitting requests", submitting.len());
+
+        for request in submitting {
+            if request.prover_type != ProverType::Boundless {
+                continue;
+            }
+
+            let ProofRequestStatus::Submitting {
+                provider_request_id,
+                expires_at,
+                tx_hash,
+            } = request.status.clone()
+            else {
+                continue;
+            };
+
+            let Some(market_request_id) = parse_provider_request_id(&provider_request_id) else {
+                tracing::warn!(
+                    "Skipping submitting request {} with invalid provider_request_id {}",
+                    request.request_id,
+                    provider_request_id
+                );
+                continue;
+            };
+
+            if market_request_id == U256::ZERO {
+                tracing::warn!(
+                    "Skipping submitting request {} with empty provider_request_id",
+                    request.request_id
+                );
+                continue;
+            }
+
+            if !self.track_active_request(&request).await {
+                continue;
+            }
+
+            // If we have a tx_hash, assume the tx was broadcast and resume polling. If the receipt
+            // is already known and reverted, fail fast.
+            if let Some(tx_hash) = tx_hash.as_deref() {
+                let Some(parsed_tx_hash) = parse_tx_hash(tx_hash) else {
+                    self.start_status_polling(
+                        &request.request_id,
+                        market_request_id,
+                        request.proof_type.clone(),
+                        self.active_requests.clone(),
+                    )
+                    .await;
+                    continue;
+                };
+
+                let boundless_client = match self.create_boundless_client().await {
+                    Ok(client) => client,
+                    Err(_) => {
+                        self.start_status_polling(
+                            &request.request_id,
+                            market_request_id,
+                            request.proof_type.clone(),
+                            self.active_requests.clone(),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+
+                match boundless_client
+                    .boundless_market
+                    .instance()
+                    .provider()
+                    .get_transaction_receipt(parsed_tx_hash)
+                    .await
+                {
+                    Ok(Some(receipt)) if !receipt.status() => {
+                        self.update_failed_status(
+                            &request.request_id,
+                            "Onchain submit transaction reverted".to_string(),
+                        )
+                        .await;
+                        continue;
+                    }
+                    Ok(_) | Err(_) => {}
+                }
+
+                self.start_status_polling(
+                    &request.request_id,
+                    market_request_id,
+                    request.proof_type.clone(),
+                    self.active_requests.clone(),
+                )
+                .await;
+                continue;
+            }
+
+            // No tx_hash persisted: confirm submission via the RequestSubmitted event; otherwise
+            // attempt a safe re-submit using the already-reserved market request id.
+            let boundless_client = match self.create_boundless_client().await {
+                Ok(client) => client,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to create boundless client for submitting request {}: {}",
+                        request.request_id,
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            match boundless_client
+                .boundless_market
+                .get_submitted_request(market_request_id, None)
+                .await
+            {
+                Ok(_) => {
+                    let submitted_status = ProofRequestStatus::Submitted {
+                        provider_request_id: provider_request_id.clone(),
+                        expires_at,
+                    };
+                    let _ = self
+                        .update_request_status(
+                            &request.request_id,
+                            submitted_status,
+                            &self.active_requests,
+                        )
+                        .await;
+                    self.start_status_polling(
+                        &request.request_id,
+                        market_request_id,
+                        request.proof_type.clone(),
+                        self.active_requests.clone(),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Submitting request {} not found onchain yet ({}); attempting resubmit",
+                        request.request_id,
+                        e
+                    );
+
+                    let Some((elf_type, proof_type, offer_params)) =
+                        resubmit_context(&self.boundless_config, &request.proof_type)
+                    else {
+                        tracing::warn!(
+                            "Skipping resubmit for update request {}",
+                            request.request_id
+                        );
+                        continue;
+                    };
+
+                    let image_info = match self
+                        .image_manager
+                        .get_image(ProverType::Boundless, elf_type.clone())
+                        .await
+                    {
+                        Some(info) => info,
+                        None => {
+                            tracing::warn!(
+                                "Skipping resubmit for {}: image not available",
+                                request.request_id
+                            );
+                            continue;
+                        }
+                    };
+
+                    let Some(image_url) = image_info.remote_url.clone() else {
+                        tracing::warn!(
+                            "Skipping resubmit for {}: image URL missing",
+                            request.request_id
+                        );
+                        continue;
+                    };
+
+                    let prover_clone = self.clone();
+                    let active_requests = self.active_requests.clone();
+                    let request_id = request.request_id.clone();
+                    let input = request.input.clone();
+                    let output = request.output.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = prover_clone
+                            .process_and_submit_request(
+                                &request_id,
+                                input,
+                                output,
+                                &image_info.elf_bytes,
+                                image_url,
+                                offer_params,
+                                proof_type,
+                                active_requests,
+                                Some(market_request_id),
+                            )
+                            .await
+                        {
+                            prover_clone
+                                .update_failed_status(&request_id, e.to_string())
+                                .await;
+                        }
+                    });
+                }
+            }
         }
     }
 
@@ -989,6 +1299,7 @@ impl BoundlessProver {
                         offer_params,
                         proof_type,
                         active_requests,
+                        None,
                     )
                     .await
                 {
@@ -1079,7 +1390,11 @@ impl BoundlessProver {
                 async_req.status = status.clone();
                 // Also update provider_request_id field when available in status
                 match &status {
-                    ProofRequestStatus::Submitted {
+                    ProofRequestStatus::Submitting {
+                        provider_request_id,
+                        ..
+                    }
+                    | ProofRequestStatus::Submitted {
                         provider_request_id,
                         ..
                     }
@@ -1131,7 +1446,8 @@ impl BoundlessProver {
             requests_guard
                 .get(request_id)
                 .and_then(|request| match &request.status {
-                    ProofRequestStatus::Submitted { expires_at, .. }
+                    ProofRequestStatus::Submitting { expires_at, .. }
+                    | ProofRequestStatus::Submitted { expires_at, .. }
                     | ProofRequestStatus::Locked { expires_at, .. } => *expires_at,
                     _ => None,
                 })
@@ -1147,16 +1463,41 @@ impl BoundlessProver {
 
         match status_result {
             Ok(new_status) => {
+                // Preserve `Submitting` while the market reports an `Unknown` state (which we map
+                // to `Submitted`). This keeps `tx_hash` available for crash-safe recovery.
+                let status_to_apply = {
+                    let current_status = {
+                        let requests_guard = active_requests.read().await;
+                        requests_guard.get(request_id).map(|r| r.status.clone())
+                    };
+
+                    match (current_status, new_status) {
+                        (
+                            Some(ProofRequestStatus::Submitting {
+                                provider_request_id,
+                                tx_hash,
+                                ..
+                            }),
+                            ProofRequestStatus::Submitted { expires_at, .. },
+                        ) => ProofRequestStatus::Submitting {
+                            provider_request_id,
+                            expires_at,
+                            tx_hash,
+                        },
+                        (_, status) => status,
+                    }
+                };
+
                 // Update the status using the helper
                 if let Err(e) = self
-                    .update_request_status(request_id, new_status.clone(), active_requests)
+                    .update_request_status(request_id, status_to_apply.clone(), active_requests)
                     .await
                 {
                     tracing::warn!("Failed to update status for {}: {}", request_id, e);
                 }
 
                 // Check if we should stop polling (fulfilled or failed)
-                match new_status {
+                match status_to_apply {
                     ProofRequestStatus::Fulfilled { .. } => {
                         tracing::info!("Proof {} completed via market", market_id_str);
                         false // Stop polling
@@ -1259,6 +1600,7 @@ impl BoundlessProver {
         offer_params: BoundlessOfferParams,
         proof_type: ProofType,
         active_requests: Arc<RwLock<HashMap<String, AsyncProofRequest>>>,
+        forced_market_request_id: Option<U256>,
     ) -> AgentResult<()> {
         let attempts = self
             .storage
@@ -1307,7 +1649,7 @@ impl BoundlessProver {
         let input_url = Some(input_url);
 
         // Build the request
-        let request = self
+        let mut request = self
             .build_boundless_request(
                 &boundless_client,
                 image_url,
@@ -1322,47 +1664,103 @@ impl BoundlessProver {
             .map_err(|e| {
                 AgentError::RequestBuildError(format!("Failed to build request: {}", e))
             })?;
+
+        if let Some(forced_id) = forced_market_request_id.filter(|id| *id != U256::ZERO) {
+            request.id = forced_id;
+        }
         let expires_at = request.expires_at();
 
-        // Submit to market
-        let market_request_id = self
-            .submit_request_async(&boundless_client, request)
-            .await
-            .map_err(|e| {
-                AgentError::RequestSubmitError(format!("Failed to submit to market: {}", e))
-            })?;
-        let provider_request_id = format!("0x{:x}", market_request_id);
+        let provider_request_id = format!("0x{:x}", request.id);
+        let market_request_id = request.id;
 
-        // Update the stored request with new provider_request_id
-        {
-            let mut requests_guard = active_requests.write().await;
-            if let Some(async_req) = requests_guard.get_mut(request_id) {
-                async_req.provider_request_id = Some(provider_request_id.clone());
-                async_req.status = ProofRequestStatus::Submitted {
-                    provider_request_id: provider_request_id.clone(),
-                    expires_at: Some(expires_at),
-                };
-            }
+        if self.config.offchain {
+            // Offchain is safe to retry (no gas cost).
+            let market_request_id = self
+                .submit_request_async(&boundless_client, request)
+                .await
+                .map_err(|e| {
+                    AgentError::RequestSubmitError(format!("Failed to submit offchain: {e}"))
+                })?;
+
+            let submitted_status = ProofRequestStatus::Submitted {
+                provider_request_id: format!("0x{:x}", market_request_id),
+                expires_at: Some(expires_at),
+            };
+            let _ = self
+                .update_request_status(request_id, submitted_status, &active_requests)
+                .await;
+
+            // Start polling market status in background
+            self.start_status_polling(request_id, market_request_id, proof_type, active_requests)
+                .await;
+            return Ok(());
         }
 
-        // Update in SQLite storage with correct provider_request_id
-        let submitted_status = ProofRequestStatus::Submitted {
-            provider_request_id,
+        // Onchain submission can be ambiguous (tx broadcast but caller didn't observe receipt).
+        // Persist an intermediate status and capture tx_hash to support crash-safe recovery.
+        let submitting_status = ProofRequestStatus::Submitting {
+            provider_request_id: provider_request_id.clone(),
             expires_at: Some(expires_at),
+            tx_hash: None,
         };
-        if let Err(e) = self
-            .storage
-            .update_status(request_id, &submitted_status)
-            .await
-        {
-            tracing::warn!("Failed to update provider request ID in storage: {}", e);
-        }
-
-        // Start polling market status in background
-        self.start_status_polling(request_id, market_request_id, proof_type, active_requests)
+        let _ = self
+            .update_request_status(request_id, submitting_status, &active_requests)
             .await;
 
-        Ok(())
+        match self
+            .submit_request_onchain_with_tx_hash(&boundless_client, &request)
+            .await
+        {
+            Ok(Some(tx_hash)) => {
+                let submitting_status = ProofRequestStatus::Submitting {
+                    provider_request_id: provider_request_id.clone(),
+                    expires_at: Some(expires_at),
+                    tx_hash: Some(tx_hash.clone()),
+                };
+                let _ = self
+                    .update_request_status(request_id, submitting_status, &active_requests)
+                    .await;
+
+                // Start polling market status in background. While the market reports `Unknown`,
+                // we keep the local state as `Submitting` to preserve tx_hash for recovery.
+                self.start_status_polling(
+                    request_id,
+                    market_request_id,
+                    proof_type,
+                    active_requests,
+                )
+                .await;
+                Ok(())
+            }
+            Ok(None) => {
+                // The tx may have been broadcast even though we didn't get a hash back (RPC timeout,
+                // node restart, etc.). Keep `Submitting` and start polling; crash-safe recovery can
+                // confirm via onchain event scan and/or a later tx receipt lookup.
+                tracing::warn!(
+                    "Onchain submit returned uncertain result for {} (provider id {})",
+                    request_id,
+                    provider_request_id
+                );
+                self.start_status_polling(
+                    request_id,
+                    market_request_id,
+                    proof_type,
+                    active_requests,
+                )
+                .await;
+                Ok(())
+            }
+            Err(e) => {
+                // Preflight failure (before send). This is not an "uncertain broadcast" case.
+                tracing::warn!(
+                    "Onchain submit returned error for {} (provider id {}): {}",
+                    request_id,
+                    provider_request_id,
+                    e
+                );
+                Err(e)
+            }
+        }
     }
 
     /// Submit a batch proof request asynchronously
@@ -1385,58 +1783,39 @@ impl BoundlessProver {
                         "Returning existing request in preparation phase for request: {}",
                         existing_request.request_id
                     );
-                    // Add to memory cache if not already there
-                    {
-                        let mut requests_guard = self.active_requests.write().await;
-                        if !requests_guard.contains_key(&existing_request.request_id) {
-                            requests_guard.insert(
-                                existing_request.request_id.clone(),
-                                existing_request.clone(),
-                            );
-                        }
-                    }
-                    return Ok(existing_request.request_id);
+                    self.ensure_request_in_cache(&existing_request).await;
+                    return Ok(existing_request.request_id.clone());
                 }
                 ProofRequestStatus::Fulfilled { .. } => {
                     tracing::info!(
                         "Returning existing completed batch proof for request: {}",
                         existing_request.request_id
                     );
-                    return Ok(existing_request.request_id);
+                    return Ok(existing_request.request_id.clone());
+                }
+                ProofRequestStatus::Submitting { .. } => {
+                    tracing::info!(
+                        "Returning existing submitting batch proof (pre-submit persisted) for request: {}",
+                        existing_request.request_id
+                    );
+                    self.ensure_request_in_cache(&existing_request).await;
+                    return Ok(existing_request.request_id.clone());
                 }
                 ProofRequestStatus::Submitted { .. } => {
                     tracing::info!(
                         "Returning existing submitted batch proof (waiting for prover) for request: {}",
                         existing_request.request_id
                     );
-                    // Add to memory cache if not already there
-                    {
-                        let mut requests_guard = self.active_requests.write().await;
-                        if !requests_guard.contains_key(&existing_request.request_id) {
-                            requests_guard.insert(
-                                existing_request.request_id.clone(),
-                                existing_request.clone(),
-                            );
-                        }
-                    }
-                    return Ok(existing_request.request_id);
+                    self.ensure_request_in_cache(&existing_request).await;
+                    return Ok(existing_request.request_id.clone());
                 }
                 ProofRequestStatus::Locked { .. } => {
                     tracing::info!(
                         "Returning existing locked batch proof (being processed by prover) for request: {}",
                         existing_request.request_id
                     );
-                    // Add to memory cache if not already there
-                    {
-                        let mut requests_guard = self.active_requests.write().await;
-                        if !requests_guard.contains_key(&existing_request.request_id) {
-                            requests_guard.insert(
-                                existing_request.request_id.clone(),
-                                existing_request.clone(),
-                            );
-                        }
-                    }
-                    return Ok(existing_request.request_id);
+                    self.ensure_request_in_cache(&existing_request).await;
+                    return Ok(existing_request.request_id.clone());
                 }
                 ProofRequestStatus::Failed { error } => {
                     tracing::info!(
@@ -1504,6 +1883,7 @@ impl BoundlessProver {
                     offer_params,
                     ProofType::Batch,
                     active_requests,
+                    None,
                 )
                 .await
             {
@@ -1536,58 +1916,39 @@ impl BoundlessProver {
                         "Returning existing request in preparation phase for request: {}",
                         existing_request.request_id
                     );
-                    // Add to memory cache if not already there
-                    {
-                        let mut requests_guard = self.active_requests.write().await;
-                        if !requests_guard.contains_key(&existing_request.request_id) {
-                            requests_guard.insert(
-                                existing_request.request_id.clone(),
-                                existing_request.clone(),
-                            );
-                        }
-                    }
-                    return Ok(existing_request.request_id);
+                    self.ensure_request_in_cache(&existing_request).await;
+                    return Ok(existing_request.request_id.clone());
                 }
                 ProofRequestStatus::Fulfilled { .. } => {
                     tracing::info!(
                         "Returning existing completed aggregation proof for request: {}",
                         existing_request.request_id
                     );
-                    return Ok(existing_request.request_id);
+                    return Ok(existing_request.request_id.clone());
+                }
+                ProofRequestStatus::Submitting { .. } => {
+                    tracing::info!(
+                        "Returning existing submitting aggregation proof (pre-submit persisted) for request: {}",
+                        existing_request.request_id
+                    );
+                    self.ensure_request_in_cache(&existing_request).await;
+                    return Ok(existing_request.request_id.clone());
                 }
                 ProofRequestStatus::Submitted { .. } => {
                     tracing::info!(
                         "Returning existing submitted aggregation proof (waiting for prover) for request: {}",
                         existing_request.request_id
                     );
-                    // Add to memory cache if not already there
-                    {
-                        let mut requests_guard = self.active_requests.write().await;
-                        if !requests_guard.contains_key(&existing_request.request_id) {
-                            requests_guard.insert(
-                                existing_request.request_id.clone(),
-                                existing_request.clone(),
-                            );
-                        }
-                    }
-                    return Ok(existing_request.request_id);
+                    self.ensure_request_in_cache(&existing_request).await;
+                    return Ok(existing_request.request_id.clone());
                 }
                 ProofRequestStatus::Locked { .. } => {
                     tracing::info!(
                         "Returning existing locked aggregation proof (being processed by prover) for request: {}",
                         existing_request.request_id
                     );
-                    // Add to memory cache if not already there
-                    {
-                        let mut requests_guard = self.active_requests.write().await;
-                        if !requests_guard.contains_key(&existing_request.request_id) {
-                            requests_guard.insert(
-                                existing_request.request_id.clone(),
-                                existing_request.clone(),
-                            );
-                        }
-                    }
-                    return Ok(existing_request.request_id);
+                    self.ensure_request_in_cache(&existing_request).await;
+                    return Ok(existing_request.request_id.clone());
                 }
                 ProofRequestStatus::Failed { error } => {
                     tracing::info!(
@@ -1654,6 +2015,7 @@ impl BoundlessProver {
                     offer_params,
                     ProofType::Aggregate,
                     active_requests,
+                    None,
                 )
                 .await
             {
