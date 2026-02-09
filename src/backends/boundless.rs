@@ -19,10 +19,12 @@ use boundless_market::{
     input::GuestEnv,
     request_builder::OfferParams,
 };
+use boundless_market::storage::StorageUploaderConfig;
 use risc0_ethereum_contracts_boundless::receipt::{Receipt as ContractReceipt, decode_seal};
 use risc0_zkvm::{Digest, Journal, Receipt as ZkvmReceipt, compute_image_id, default_executor};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::sync::RwLock;
@@ -31,10 +33,50 @@ use url::Url;
 
 use boundless_market::alloy::providers::Provider;
 
+trait GuestEvaluator: Send + Sync {
+    fn evaluate(&self, guest_env: GuestEnv, elf: &[u8]) -> AgentResult<(u64, Vec<u8>)>;
+}
+
+#[derive(Debug)]
+struct Risc0GuestEvaluator;
+
+impl GuestEvaluator for Risc0GuestEvaluator {
+    fn evaluate(&self, guest_env: GuestEnv, elf: &[u8]) -> AgentResult<(u64, Vec<u8>)> {
+        let session_info = default_executor()
+            .execute(guest_env.try_into().unwrap(), elf)
+            .map_err(|e| AgentError::GuestExecutionError(format!("Failed to execute guest: {e}")))?;
+
+        let mcycles_count = session_info
+            .segments
+            .iter()
+            .map(|segment| 1u64 << segment.po2)
+            .sum::<u64>()
+            .div_ceil(MILLION_CYCLES);
+
+        Ok((mcycles_count, session_info.journal.bytes))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DeploymentType {
     Sepolia,
     Base,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PricingMode {
+    /// Always use explicitly configured prices/collateral from `BoundlessConfig`.
+    Manual,
+    /// Allow the Boundless SDK to fill prices/collateral automatically (indexer/defaults)
+    /// when they are not explicitly provided in `OfferParams`.
+    Auto,
+}
+
+impl Default for PricingMode {
+    fn default() -> Self {
+        Self::Manual
+    }
 }
 
 impl FromStr for DeploymentType {
@@ -169,10 +211,12 @@ pub struct BoundlessOfferParams {
     pub ramp_up_period_blocks: u32,
     pub lock_timeout_ms_per_mcycle: u32,
     pub timeout_ms_per_mcycle: u32,
-    pub max_price_per_mcycle: String,
+    #[serde(default)]
+    pub max_price_per_mcycle: Option<String>,
     #[serde(default)]
     pub min_price_per_mcycle: Option<String>,
-    pub lock_collateral: String,
+    #[serde(default)]
+    pub lock_collateral: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -180,6 +224,8 @@ pub struct BoundlessConfig {
     pub deployment: Option<DeploymentConfig>,
     pub offer_params: OfferParamsConfig,
     pub rpc_url: Option<String>,
+    #[serde(default)]
+    pub pricing_mode: PricingMode,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -246,17 +292,37 @@ impl BoundlessConfig {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct ProverConfig {
     pub offchain: bool,
     pub pull_interval: u64,
     pub rpc_url: String,
     pub boundless_config: BoundlessConfig,
+    pub storage_uploader_config: StorageUploaderConfig,
     pub url_ttl: u64,
     pub signer_key: String,
+    /// If set, never submit to Boundless Market. Instead, execute the guest locally to produce
+    /// the expected journal bytes and mark the request as fulfilled (no spending).
+    pub evaluation_only: bool,
 }
 
-#[derive(Clone, Debug)]
+impl fmt::Debug for ProverConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Avoid leaking secrets (signer keys, JWTs, etc.) in logs.
+        f.debug_struct("ProverConfig")
+            .field("offchain", &self.offchain)
+            .field("pull_interval", &self.pull_interval)
+            .field("rpc_url", &self.rpc_url)
+            .field("boundless_config", &self.boundless_config)
+            .field("storage_uploader_config", &"<redacted>")
+            .field("url_ttl", &self.url_ttl)
+            .field("signer_key", &"<redacted>")
+            .field("evaluation_only", &self.evaluation_only)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct BoundlessProver {
     config: ProverConfig,
     deployment: Deployment,
@@ -264,6 +330,21 @@ pub struct BoundlessProver {
     active_requests: Arc<RwLock<HashMap<String, AsyncProofRequest>>>,
     storage: RequestStorage,
     image_manager: ImageManager,
+    guest_evaluator: Arc<dyn GuestEvaluator>,
+}
+
+impl fmt::Debug for BoundlessProver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BoundlessProver")
+            .field("config", &self.config)
+            .field("deployment", &self.deployment)
+            .field("boundless_config", &self.boundless_config)
+            .field("active_requests", &"<redacted>")
+            .field("storage", &"<redacted>")
+            .field("image_manager", &"<redacted>")
+            .field("guest_evaluator", &"<redacted>")
+            .finish()
+    }
 }
 
 static TTL_CLEANUP_HANDLE: OnceLock<tokio::sync::Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
@@ -281,7 +362,6 @@ impl BoundlessProver {
     /// Create a boundless client with the current configuration
     pub async fn create_boundless_client(&self) -> AgentResult<Client> {
         let deployment = Some(self.deployment.clone());
-        let storage_provider = boundless_market::storage::storage_provider_from_env().ok();
 
         let url = Url::parse(&self.config.rpc_url)
             .map_err(|e| AgentError::ClientBuildError(e.to_string()))?;
@@ -291,11 +371,17 @@ impl BoundlessProver {
             .parse()
             .map_err(|e| AgentError::ClientBuildError(format!("invalid signer key: {e}")))?;
 
-        let client = Client::builder()
+        let builder = Client::builder()
             .with_rpc_url(url)
             .with_deployment(deployment)
-            .with_storage_provider(storage_provider)
-            .with_private_key(signer)
+            .with_private_key(signer.clone());
+
+        let builder = builder
+            .with_uploader_config(&self.config.storage_uploader_config)
+            .await
+            .map_err(|e| AgentError::ClientBuildError(e.to_string()))?;
+
+        let client = builder
             .build()
             .await
             .map_err(|e| AgentError::ClientBuildError(e.to_string()))?;
@@ -437,7 +523,7 @@ impl BoundlessProver {
             Some(expires_at) => Some(expires_at),
             None => match boundless_client
                 .boundless_market
-                .get_submitted_request(market_request_id, None)
+                .get_submitted_request(market_request_id, None, None, None)
                 .await
             {
                 Ok((request, _)) => Some(request.expires_at()),
@@ -507,7 +593,7 @@ impl BoundlessProver {
                             || {
                                 boundless_client
                                     .boundless_market
-                                    .get_request_fulfillment(market_request_id)
+                                    .get_request_fulfillment(market_request_id, None, None)
                             },
                             MAX_RETRY_ATTEMPTS,
                         )
@@ -673,6 +759,44 @@ impl BoundlessProver {
         Ok((guest_env, guest_env_bytes))
     }
 
+    async fn evaluate_and_complete_request(
+        &self,
+        request_id: &str,
+        proof_type: ProofType,
+        input: Vec<u8>,
+        expected_output: Vec<u8>,
+        elf: &[u8],
+        active_requests: Arc<RwLock<HashMap<String, AsyncProofRequest>>>,
+    ) -> AgentResult<()> {
+        let (guest_env, _guest_env_bytes) = self.process_input(input).map_err(|e| {
+            AgentError::GuestEnvEncodeError(format!("Failed to process input: {}", e))
+        })?;
+
+        let (mcycles_count, journal) = self.guest_evaluator.evaluate(guest_env, elf)?;
+        tracing::info!(
+            "evaluation_only=true: proof_type={:?} mcycles={} journal_len={}",
+            proof_type,
+            mcycles_count,
+            journal.len()
+        );
+
+        if !expected_output.is_empty() && expected_output != journal {
+            return Err(AgentError::GuestExecutionError(format!(
+                "evaluation_only output mismatch: expected {} bytes, got {} bytes",
+                expected_output.len(),
+                journal.len()
+            )));
+        }
+
+        let status = ProofRequestStatus::Fulfilled {
+            provider_request_id: format!("local_eval:{}", request_id),
+            proof: journal,
+        };
+        self.update_request_status(request_id, status, &active_requests)
+            .await?;
+        Ok(())
+    }
+
     pub async fn new(
         config: ProverConfig,
         image_manager: ImageManager,
@@ -706,6 +830,7 @@ impl BoundlessProver {
             active_requests: Arc::new(RwLock::new(HashMap::new())),
             storage: storage.clone(),
             image_manager: image_manager.clone(),
+            guest_evaluator: Arc::new(Risc0GuestEvaluator),
         };
 
         match storage.load_images().await {
@@ -785,6 +910,31 @@ impl BoundlessProver {
         Ok(prover)
     }
 
+    #[cfg(test)]
+    async fn new_with_evaluator(
+        mut config: ProverConfig,
+        image_manager: ImageManager,
+        storage: RequestStorage,
+        guest_evaluator: Arc<dyn GuestEvaluator>,
+    ) -> AgentResult<Self> {
+        let deployment = BoundlessProver::create_deployment(&config)?;
+
+        storage.initialize().await?;
+        // Prevent background tasks from interfering with tests.
+        config.pull_interval = 10;
+
+        let boundless_config = config.boundless_config.clone();
+        Ok(BoundlessProver {
+            config,
+            deployment,
+            boundless_config,
+            active_requests: Arc::new(RwLock::new(HashMap::new())),
+            storage,
+            image_manager,
+            guest_evaluator,
+        })
+    }
+
     #[allow(clippy::collapsible_if)]
     pub async fn upload_image(
         &self,
@@ -799,6 +949,36 @@ impl BoundlessProver {
         let image_id = compute_image_id(&elf_bytes).map_err(|e| {
             AgentError::ProgramUploadError(format!("Failed to compute image_id: {e}"))
         })?;
+
+        if self.config.evaluation_only {
+            let info = ImageInfo {
+                image_id: Some(image_id),
+                remote_url: None,
+                elf_bytes,
+                refresh_at: None,
+            };
+
+            self.image_manager
+                .set_image(ProverType::Boundless, elf_type.clone(), info.clone())
+                .await;
+
+            if let Some(image_id) = info.image_id {
+                if let Err(e) = self
+                    .storage
+                    .persist_image(ProverType::Boundless, elf_type, image_id, &info.elf_bytes)
+                    .await
+                {
+                    tracing::warn!("Failed to persist image cache: {}", e);
+                }
+            }
+
+            tracing::info!(
+                "evaluation_only=true: cached {} image locally (image_id={:?})",
+                image_label,
+                image_id
+            );
+            return Ok(ImageUploadResult { info, reused: false });
+        }
 
         if let Some(existing_info) = self
             .image_manager
@@ -1132,7 +1312,7 @@ impl BoundlessProver {
 
             match boundless_client
                 .boundless_market
-                .get_submitted_request(market_request_id, None)
+                .get_submitted_request(market_request_id, None, None, None)
                 .await
             {
                 Ok(_) => {
@@ -1602,6 +1782,20 @@ impl BoundlessProver {
         active_requests: Arc<RwLock<HashMap<String, AsyncProofRequest>>>,
         forced_market_request_id: Option<U256>,
     ) -> AgentResult<()> {
+        if self.config.evaluation_only {
+            tracing::info!("evaluation_only=true: executing guest locally for {}", request_id);
+            return self
+                .evaluate_and_complete_request(
+                    request_id,
+                    proof_type,
+                    input,
+                    output,
+                    elf,
+                    active_requests,
+                )
+                .await;
+        }
+
         let attempts = self
             .storage
             .increment_submission_attempts(request_id)
@@ -1864,6 +2058,25 @@ impl BoundlessProver {
                 }
             };
 
+            if prover_clone.config.evaluation_only {
+                if let Err(e) = prover_clone
+                    .evaluate_and_complete_request(
+                        &request_id_clone,
+                        ProofType::Batch,
+                        input,
+                        output,
+                        &image_info.elf_bytes,
+                        active_requests,
+                    )
+                    .await
+                {
+                    prover_clone
+                        .update_failed_status(&request_id_clone, e.to_string())
+                        .await;
+                }
+                return;
+            }
+
             let Some(image_url) = image_info.remote_url.clone() else {
                 let err_msg = "Batch image URL missing after upload.";
                 tracing::error!("{}", err_msg);
@@ -1995,6 +2208,25 @@ impl BoundlessProver {
                     return;
                 }
             };
+
+            if prover_clone.config.evaluation_only {
+                if let Err(e) = prover_clone
+                    .evaluate_and_complete_request(
+                        &request_id_clone,
+                        ProofType::Aggregate,
+                        input,
+                        output,
+                        &image_info.elf_bytes,
+                        active_requests,
+                    )
+                    .await
+                {
+                    prover_clone
+                        .update_failed_status(&request_id_clone, e.to_string())
+                        .await;
+                }
+                return;
+            }
 
             let Some(image_url) = image_info.remote_url.clone() else {
                 let err_msg = "Aggregation image URL missing after upload.";
@@ -2217,13 +2449,19 @@ impl BoundlessProver {
         })?;
 
         let block_time_sec = self.boundless_config.block_time_sec();
-        let validated = validate_offer_params(offer_spec, mcycles_count, block_time_sec)?;
+        let validated = validate_offer_params(
+            self.boundless_config.pricing_mode.clone(),
+            offer_spec,
+            mcycles_count,
+            block_time_sec,
+        )?;
         tracing::info!(
-            "Derived offer params: lock_timeout={}s timeout={}s ramp_up_period_blocks={} bidding_start={} max_price={} min_price={} lock_collateral={}",
+            "Derived offer params: lock_timeout={}s timeout={}s ramp_up_period_blocks={} bidding_start={} pricing_mode={:?} max_price={:?} min_price={:?} lock_collateral={:?}",
             validated.lock_timeout,
             validated.timeout,
             validated.ramp_up_period,
             validated.bidding_start,
+            self.boundless_config.pricing_mode,
             validated.max_price,
             validated.min_price,
             validated.lock_collateral
@@ -2239,16 +2477,24 @@ impl BoundlessProver {
             .with_cycles(mcycles_count as u64 * MILLION_CYCLES)
             .with_image_id(image_id)
             .with_journal(Journal::new(journal))
-            .with_offer(
-                OfferParams::builder()
+            .with_offer({
+                let mut builder = OfferParams::builder();
+                builder
                     .ramp_up_period(validated.ramp_up_period)
                     .lock_timeout(validated.lock_timeout)
                     .timeout(validated.timeout)
-                    .max_price(validated.max_price)
-                    .min_price(validated.min_price)
-                    .lock_collateral(validated.lock_collateral)
-                    .bidding_start(validated.bidding_start),
-            );
+                    .bidding_start(validated.bidding_start);
+                if let Some(max_price) = validated.max_price {
+                    builder.max_price(max_price);
+                }
+                if let Some(min_price) = validated.min_price {
+                    builder.min_price(min_price);
+                }
+                if let Some(lock_collateral) = validated.lock_collateral {
+                    builder.lock_collateral(lock_collateral);
+                }
+                builder
+            });
 
         if let Some(url) = input_url {
             // with_input_url returns Result; unwrap here is safe because Infallible cannot occur
@@ -2270,9 +2516,9 @@ impl BoundlessProver {
 
 #[derive(Debug)]
 struct ValidatedOfferParams {
-    max_price: U256,
-    min_price: U256,
-    lock_collateral: U256,
+    max_price: Option<U256>,
+    min_price: Option<U256>,
+    lock_collateral: Option<U256>,
     lock_timeout: u32,
     timeout: u32,
     ramp_up_period: u32,
@@ -2280,32 +2526,51 @@ struct ValidatedOfferParams {
 }
 
 fn validate_offer_params(
+    pricing_mode: PricingMode,
     offer_spec: &BoundlessOfferParams,
     mcycles_count: u32,
     block_time_sec: u32,
 ) -> AgentResult<ValidatedOfferParams> {
-    let max_price = parse_ether(&offer_spec.max_price_per_mcycle).map_err(|e| {
-        AgentError::ClientBuildError(format!(
-            "Failed to parse max_price_per_mcycle: {} ({})",
-            offer_spec.max_price_per_mcycle, e
-        ))
-    })? * U256::from(mcycles_count);
+    let max_price = match (pricing_mode.clone(), offer_spec.max_price_per_mcycle.as_deref()) {
+        (PricingMode::Manual, None) => {
+            return Err(AgentError::RequestBuildError(
+                "pricing_mode=manual requires offer_params.*.max_price_per_mcycle".to_string(),
+            ));
+        }
+        (_, None) => None,
+        (_, Some(v)) => Some(
+            parse_ether(v).map_err(|e| {
+                AgentError::ClientBuildError(format!("Failed to parse max_price_per_mcycle: {v} ({e})"))
+            })? * U256::from(mcycles_count),
+        ),
+    };
 
-    let min_price_value = offer_spec.min_price_per_mcycle.as_deref().unwrap_or("0");
-    let min_price = parse_ether(min_price_value).map_err(|e| {
-        AgentError::ClientBuildError(format!(
-            "Failed to parse min_price_per_mcycle: {} ({})",
-            min_price_value, e
-        ))
-    })? * U256::from(mcycles_count);
+    let min_price = match offer_spec.min_price_per_mcycle.as_deref() {
+        None => None,
+        Some(v) => Some(
+            parse_ether(v).map_err(|e| {
+                AgentError::ClientBuildError(format!("Failed to parse min_price_per_mcycle: {v} ({e})"))
+            })? * U256::from(mcycles_count),
+        ),
+    };
 
-    if min_price > max_price {
-        return Err(AgentError::RequestBuildError(
-            "min_price_per_mcycle cannot exceed max_price_per_mcycle".to_string(),
-        ));
+    if let (Some(min), Some(max)) = (min_price, max_price) {
+        if min > max {
+            return Err(AgentError::RequestBuildError(
+                "min_price_per_mcycle cannot exceed max_price_per_mcycle".to_string(),
+            ));
+        }
     }
 
-    let lock_collateral = parse_staking_token(&offer_spec.lock_collateral)?;
+    let lock_collateral = match (pricing_mode, offer_spec.lock_collateral.as_deref()) {
+        (PricingMode::Manual, None) => {
+            return Err(AgentError::RequestBuildError(
+                "pricing_mode=manual requires offer_params.*.lock_collateral".to_string(),
+            ));
+        }
+        (_, None) => None,
+        (_, Some(v)) => Some(parse_staking_token(v)? * U256::from(mcycles_count)),
+    };
     let lock_timeout = offer_spec.lock_timeout_ms_per_mcycle * mcycles_count / 1000u32;
     let timeout = offer_spec.timeout_ms_per_mcycle * mcycles_count / 1000u32;
 
@@ -2369,9 +2634,9 @@ mod tests {
             ramp_up_period_blocks: 15,
             lock_timeout_ms_per_mcycle: 90,
             timeout_ms_per_mcycle: 215,
-            max_price_per_mcycle: "0.00003".to_string(),
+            max_price_per_mcycle: Some("0.00003".to_string()),
             min_price_per_mcycle: Some("0.000005".to_string()),
-            lock_collateral: "0.0001".to_string(),
+            lock_collateral: Some("0.0001".to_string()),
         }
     }
 
@@ -2381,9 +2646,9 @@ mod tests {
             ramp_up_period_blocks: 15,
             lock_timeout_ms_per_mcycle: 1500,
             timeout_ms_per_mcycle: 4500,
-            max_price_per_mcycle: "0.00001".to_string(),
+            max_price_per_mcycle: Some("0.00001".to_string()),
             min_price_per_mcycle: Some("0.000003".to_string()),
-            lock_collateral: "0.0001".to_string(),
+            lock_collateral: Some("0.0001".to_string()),
         }
     }
 
@@ -2406,10 +2671,88 @@ mod tests {
                 }),
                 offer_params: test_offer_params_config(),
                 rpc_url: None,
+                pricing_mode: PricingMode::Manual,
             },
+            storage_uploader_config: StorageUploaderConfig::dev_mode(),
             url_ttl: 1800,
             signer_key: "0x0000000000000000000000000000000000000000000000000000000000000001"
                 .to_string(),
+            evaluation_only: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn evaluation_only_completes_without_signer_or_remote_url() {
+        use crate::image_manager::ImageInfo;
+
+        #[derive(Debug)]
+        struct MockEval;
+        impl super::GuestEvaluator for MockEval {
+            fn evaluate(
+                &self,
+                _guest_env: GuestEnv,
+                _elf: &[u8],
+            ) -> AgentResult<(u64, Vec<u8>)> {
+                Ok((1, vec![7u8, 7u8, 7u8]))
+            }
+        }
+
+        let mut cfg = test_prover_config();
+        cfg.evaluation_only = true;
+        cfg.rpc_url = "not a url".to_string();
+        cfg.signer_key = "invalid".to_string();
+
+        let image_manager = ImageManager::new();
+        let storage = RequestStorage::new(":memory:".to_string());
+        let prover = BoundlessProver::new_with_evaluator(
+            cfg,
+            image_manager.clone(),
+            storage,
+            Arc::new(MockEval),
+        )
+        .await
+        .unwrap();
+
+        // Local-only image is fine in evaluation_only.
+        image_manager
+            .set_image(
+                ProverType::Boundless,
+                ElfType::Batch,
+                ImageInfo {
+                    image_id: None,
+                    remote_url: None,
+                    elf_bytes: vec![0u8],
+                    refresh_at: None,
+                },
+            )
+            .await;
+
+        let request_id = prover
+            .batch_run(
+                "eval_req".to_string(),
+                vec![1u8, 2u8, 3u8],
+                Vec::new(),
+                &serde_json::Value::default(),
+            )
+            .await
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(req) = prover.get_request_status(&request_id).await {
+                match req.status {
+                    ProofRequestStatus::Fulfilled { proof, .. } => {
+                        assert_eq!(proof, vec![7u8, 7u8, 7u8]);
+                        break;
+                    }
+                    ProofRequestStatus::Failed { error } => panic!("unexpected failed: {error}"),
+                    _ => {}
+                };
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("timed out waiting for evaluation_only fulfillment");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 
@@ -2680,6 +3023,7 @@ mod tests {
             }),
             offer_params: test_offer_params_config(),
             rpc_url: None,
+            pricing_mode: PricingMode::Manual,
         };
 
         // Test serialization and deserialization
@@ -2704,6 +3048,7 @@ mod tests {
             }),
             offer_params: test_offer_params_config(),
             rpc_url: None,
+            pricing_mode: PricingMode::Manual,
         };
 
         let prover_config = ProverConfig {
@@ -2711,9 +3056,11 @@ mod tests {
             pull_interval: 15,
             rpc_url: "https://custom-rpc.com".to_string(),
             boundless_config,
+            storage_uploader_config: StorageUploaderConfig::dev_mode(),
             url_ttl: 1800,
             signer_key: "0x0000000000000000000000000000000000000000000000000000000000000001"
                 .to_string(),
+            evaluation_only: false,
         };
 
         // Test that the deployment is created correctly from boundless_config
@@ -2736,6 +3083,7 @@ mod tests {
             }),
             offer_params: test_offer_params_config(),
             rpc_url: None,
+            pricing_mode: PricingMode::Manual,
         };
 
         let deployment = config.get_effective_deployment();
@@ -2752,7 +3100,7 @@ mod tests {
     #[test]
     fn test_offer_params_max_price() {
         let offer_params = test_batch_offer_params();
-        let max_price_per_mcycle = parse_ether(&offer_params.max_price_per_mcycle)
+        let max_price_per_mcycle = parse_ether(offer_params.max_price_per_mcycle.as_deref().unwrap())
             .expect("Failed to parse max_price_per_mcycle");
         let max_price = max_price_per_mcycle * U256::from(1000u64);
         // 0.00003 * 1000 = 0.03 ETH
@@ -2764,7 +3112,8 @@ mod tests {
         let min_price = min_price_per_mcycle * U256::from(1000u64);
         assert!(min_price <= max_price);
 
-        let lock_collateral_per_mcycle = parse_staking_token(&offer_params.lock_collateral)
+        let lock_collateral_per_mcycle =
+            parse_staking_token(offer_params.lock_collateral.as_deref().unwrap())
             .expect("Failed to parse lock_collateral_per_mcycle");
         let lock_collateral = lock_collateral_per_mcycle * U256::from(1000u64);
         // 0.0001 * 1000 = 0.1 USDC
@@ -2775,9 +3124,9 @@ mod tests {
     fn validate_offer_params_rejects_min_gt_max() {
         let mut offer_params = test_batch_offer_params();
         offer_params.min_price_per_mcycle = Some("0.0001".to_string());
-        offer_params.max_price_per_mcycle = "0.00001".to_string();
+        offer_params.max_price_per_mcycle = Some("0.00001".to_string());
 
-        let result = validate_offer_params(&offer_params, 7000, 2);
+        let result = validate_offer_params(PricingMode::Manual, &offer_params, 7000, 2);
         assert!(result.is_err());
     }
 
@@ -2787,7 +3136,7 @@ mod tests {
         offer_params.lock_timeout_ms_per_mcycle = 200;
         offer_params.timeout_ms_per_mcycle = 100;
 
-        let result = validate_offer_params(&offer_params, 7000, 2);
+        let result = validate_offer_params(PricingMode::Manual, &offer_params, 7000, 2);
         assert!(result.is_err());
     }
 
@@ -2798,15 +3147,40 @@ mod tests {
         offer_params.lock_timeout_ms_per_mcycle = 100;
         offer_params.timeout_ms_per_mcycle = 200;
 
-        let result = validate_offer_params(&offer_params, 7000, 2);
+        let result = validate_offer_params(PricingMode::Manual, &offer_params, 7000, 2);
         assert!(result.is_err());
     }
 
     #[test]
     fn validate_offer_params_accepts_valid_config() {
         let offer_params = test_batch_offer_params();
-        let result = validate_offer_params(&offer_params, 7000, 2);
+        let result = validate_offer_params(PricingMode::Manual, &offer_params, 7000, 2);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_offer_params_auto_allows_missing_prices_and_collateral() {
+        let mut offer_params = test_batch_offer_params();
+        offer_params.max_price_per_mcycle = None;
+        offer_params.min_price_per_mcycle = None;
+        offer_params.lock_collateral = None;
+
+        let result = validate_offer_params(PricingMode::Auto, &offer_params, 7000, 2);
+        assert!(result.is_ok());
+        let validated = result.unwrap();
+        assert!(validated.max_price.is_none());
+        assert!(validated.min_price.is_none());
+        assert!(validated.lock_collateral.is_none());
+    }
+
+    #[test]
+    fn validate_offer_params_manual_rejects_missing_required_fields() {
+        let mut offer_params = test_batch_offer_params();
+        offer_params.max_price_per_mcycle = None;
+        offer_params.lock_collateral = None;
+
+        let result = validate_offer_params(PricingMode::Manual, &offer_params, 7000, 2);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -2818,6 +3192,7 @@ mod tests {
             }),
             offer_params: test_offer_params_config(),
             rpc_url: None,
+            pricing_mode: PricingMode::Manual,
         };
 
         assert!(resubmit_context(&config, &ProofType::Update(ElfType::Batch)).is_none());

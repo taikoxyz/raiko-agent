@@ -1,0 +1,43 @@
+{
+  "base_url": null,
+  "agent": {
+    "spawn": true,
+    "binary_path": "target/release/raiko-agent",
+    "address": "127.0.0.1",
+    "port": null,
+    "config_file": "config/boundless_config_docker.json",
+    "offchain": false,
+    "evaluation_only": true,
+    "env": {
+      "RUST_LOG": "raiko_agent=info,boundless_market=debug",
+      "SQLITE_DB_PATH": "./proof_requests.db",
+      "//": "Optional: set BOUNDLESS_SIGNER_KEY when evaluation_only=false"
+    }
+  },
+  "upload": {
+    "prover_type": "boundless",
+    "image_type": "batch",
+    "elf_path": null,
+    "docker_elf": {
+      "image": "us-docker.pkg.dev/evmchain/images/raiko-zk:1.14.2",
+      "internal_path": "/opt/raiko/provers/risc0/elf/boundless-batch.bin"
+    }
+  },
+  "proof": {
+    "prover_type": "boundless",
+    "proof_type": "batch",
+    "input_path": "tests/fixtures/hoodi.shasta.1.input.json",
+    "input_encoding": "auto",
+    "output_path": "tests/fixtures/hoodi.shasta.1.output.json",
+    "output_encoding": "auto",
+    "request_config_path": null
+  },
+  "poll": {
+    "interval_ms": 2000,
+    "health_timeout_ms": 30000,
+    "submit_timeout_ms": 60000,
+    "require_fulfilled": false,
+    "fulfill_timeout_ms": 900000
+  }
+}
+
