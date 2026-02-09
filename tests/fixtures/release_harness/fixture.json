@@ -26,9 +26,9 @@
   "proof": {
     "prover_type": "boundless",
     "proof_type": "batch",
-    "input_path": "tests/fixtures/hoodi.shasta.1.input.json",
+    "input_path": "tests/fixtures/hoodi.shasta.1.input.bin",
     "input_encoding": "auto",
-    "output_path": "tests/fixtures/hoodi.shasta.1.output.json",
+    "output_path": "tests/fixtures/hoodi.shasta.1.output.bin",
     "output_encoding": "auto",
     "request_config_path": null
   },

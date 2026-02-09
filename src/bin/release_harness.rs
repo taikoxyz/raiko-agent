@@ -694,7 +694,7 @@ async fn submit_proof(
         "prover_type": cfg.prover_type,
         "input": input,
         "proof_type": cfg.proof_type,
-        "output": output,
+        "output": Vec::<u8>::new()
     });
     if let Some(v) = request_config {
         body["config"] = v;
