@@ -110,6 +110,17 @@ struct CmdArgs {
     #[arg(long)]
     config_file: Option<String>,
 
+    /// Storage uploader configuration for Boundless program/input uploads.
+    ///
+    /// This is parsed from CLI flags and environment variables supported by the Boundless SDK.
+    #[command(flatten)]
+    storage_uploader: boundless_market::storage::StorageUploaderConfig,
+
+    /// Evaluation-only mode: execute the guest locally and mark requests as completed without
+    /// submitting to Boundless Market (no spending).
+    #[arg(long, env = "BOUNDLESS_EVALUATION_ONLY", default_value_t = false)]
+    evaluation_only: bool,
+
     /// Optional API key required for all non-health requests
     #[arg(long, env = "BOUNDLESS_API_KEY")]
     api_key: Option<String>,
@@ -129,6 +140,8 @@ impl fmt::Debug for CmdArgs {
                 &self.signer_key.as_ref().map(|_| "<redacted>"),
             )
             .field("config_file", &self.config_file)
+            .field("storage_uploader", &self.storage_uploader.storage_uploader)
+            .field("evaluation_only", &self.evaluation_only)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .finish()
     }
@@ -171,15 +184,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .signer_key
         .clone()
         .or_else(|| std::env::var("BOUNDLESS_SIGNER_KEY").ok())
-        .expect("BOUNDLESS_SIGNER_KEY is not set and --signer-key not provided");
+        .unwrap_or_else(|| {
+            if args.evaluation_only {
+                // Not used in evaluation-only mode, but ProverConfig requires a value.
+                "0x0000000000000000000000000000000000000000000000000000000000000001".to_string()
+            } else {
+                panic!("BOUNDLESS_SIGNER_KEY is not set and --signer-key not provided");
+            }
+        });
 
     let prover_config = ProverConfig {
         offchain: args.offchain,
         pull_interval: args.pull_interval,
         rpc_url,
         boundless_config,
+        storage_uploader_config: args.storage_uploader.clone(),
         url_ttl: args.url_ttl,
         signer_key,
+        evaluation_only: args.evaluation_only,
     };
     tracing::info!("Start with prover config: {:?}", prover_config);
 
@@ -289,6 +311,8 @@ mod tests {
             url_ttl: 1800,
             signer_key: Some("0xdeadbeef".to_string()),
             config_file: Some("config.json".to_string()),
+            storage_uploader: boundless_market::storage::StorageUploaderConfig::default(),
+            evaluation_only: false,
             api_key: Some("supersecret".to_string()),
         };
 

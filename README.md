@@ -156,3 +156,30 @@ IMAGE_NAME=raiko-agent-custom ./script/publish-image.sh <tag>
 ```bash
 cargo test
 ```
+
+## Release harness (smoke test)
+
+This repo includes a best-effort end-to-end harness intended for **release verification** (not CI).
+It runs one fixture through the HTTP API: upload ELF → submit `/proof` → poll `/status`.
+
+### Setup
+
+- Put a Boundless batch ELF at `tests/fixtures/release_harness/boundless_batch.elf`
+- Update `tests/fixtures/release_harness/fixture.json` with:
+  - `BOUNDLESS_SIGNER_KEY`
+  - any required storage uploader env vars (S3/Pinata/etc.)
+  - an agent config file (`--config-file`)
+
+Build release binary:
+
+```bash
+cargo build --release
+```
+
+### Run
+
+```bash
+cargo run --bin release_harness -- --fixture tests/fixtures/release_harness/fixture.json
+```
+
+To run against an already-running agent, set `"base_url"` and `"agent.spawn": false` in the fixture manifest.
