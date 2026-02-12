@@ -12,6 +12,7 @@ use alloy_primitives_v1p2p0::{
     utils::{parse_ether, parse_units},
 };
 use alloy_signer_local_v1p0p12::PrivateKeySigner;
+use boundless_market::storage::StorageUploaderConfig;
 use boundless_market::{
     Client, ProofRequest,
     contracts::RequestStatus,
@@ -19,7 +20,6 @@ use boundless_market::{
     input::GuestEnv,
     request_builder::OfferParams,
 };
-use boundless_market::storage::StorageUploaderConfig;
 use risc0_ethereum_contracts_boundless::receipt::{Receipt as ContractReceipt, decode_seal};
 use risc0_zkvm::{Digest, Journal, Receipt as ZkvmReceipt, compute_image_id, default_executor};
 use serde::{Deserialize, Serialize};
@@ -42,13 +42,15 @@ struct Risc0GuestEvaluator;
 
 impl GuestEvaluator for Risc0GuestEvaluator {
     fn evaluate(&self, guest_env: GuestEnv, elf: &[u8]) -> AgentResult<(u64, Vec<u8>)> {
-        let converted_guest_env = guest_env
-            .try_into()
-            .map_err(|e| AgentError::GuestExecutionError(format!("Failed to convert guest env: {e}")))?;
+        let converted_guest_env = guest_env.try_into().map_err(|e| {
+            AgentError::GuestExecutionError(format!("Failed to convert guest env: {e}"))
+        })?;
 
         let session_info = default_executor()
             .execute(converted_guest_env, elf)
-            .map_err(|e| AgentError::GuestExecutionError(format!("Failed to execute guest: {e}")))?;
+            .map_err(|e| {
+                AgentError::GuestExecutionError(format!("Failed to execute guest: {e}"))
+            })?;
 
         let mcycles_count = session_info
             .segments
@@ -595,9 +597,11 @@ impl BoundlessProver {
                         let fulfillment_result = retry_with_backoff(
                             "get_request_fulfillment",
                             || {
-                                boundless_client
-                                    .boundless_market
-                                    .get_request_fulfillment(market_request_id, None, None)
+                                boundless_client.boundless_market.get_request_fulfillment(
+                                    market_request_id,
+                                    None,
+                                    None,
+                                )
                             },
                             MAX_RETRY_ATTEMPTS,
                         )
@@ -799,7 +803,9 @@ impl BoundlessProver {
             receipt: None,
         };
         let proof_bytes = bincode::serialize(&response).map_err(|e| {
-            AgentError::ResponseEncodeError(format!("Failed to encode evaluation_only response: {e}"))
+            AgentError::ResponseEncodeError(format!(
+                "Failed to encode evaluation_only response: {e}"
+            ))
         })?;
 
         let status = ProofRequestStatus::Fulfilled {
@@ -991,7 +997,10 @@ impl BoundlessProver {
                 image_label,
                 image_id
             );
-            return Ok(ImageUploadResult { info, reused: false });
+            return Ok(ImageUploadResult {
+                info,
+                reused: false,
+            });
         }
 
         if let Some(existing_info) = self
@@ -1797,7 +1806,10 @@ impl BoundlessProver {
         forced_market_request_id: Option<U256>,
     ) -> AgentResult<()> {
         if self.config.evaluation_only {
-            tracing::info!("evaluation_only=true: executing guest locally for {}", request_id);
+            tracing::info!(
+                "evaluation_only=true: executing guest locally for {}",
+                request_id
+            );
             return self
                 .evaluate_and_complete_request(
                     request_id,
@@ -2545,7 +2557,10 @@ fn validate_offer_params(
     mcycles_count: u32,
     block_time_sec: u32,
 ) -> AgentResult<ValidatedOfferParams> {
-    let max_price = match (pricing_mode.clone(), offer_spec.max_price_per_mcycle.as_deref()) {
+    let max_price = match (
+        pricing_mode.clone(),
+        offer_spec.max_price_per_mcycle.as_deref(),
+    ) {
         (PricingMode::Manual, None) => {
             return Err(AgentError::RequestBuildError(
                 "pricing_mode=manual requires offer_params.*.max_price_per_mcycle".to_string(),
@@ -2554,7 +2569,9 @@ fn validate_offer_params(
         (_, None) => None,
         (_, Some(v)) => Some(
             parse_ether(v).map_err(|e| {
-                AgentError::ClientBuildError(format!("Failed to parse max_price_per_mcycle: {v} ({e})"))
+                AgentError::ClientBuildError(format!(
+                    "Failed to parse max_price_per_mcycle: {v} ({e})"
+                ))
             })? * U256::from(mcycles_count),
         ),
     };
@@ -2563,7 +2580,9 @@ fn validate_offer_params(
         None => None,
         Some(v) => Some(
             parse_ether(v).map_err(|e| {
-                AgentError::ClientBuildError(format!("Failed to parse min_price_per_mcycle: {v} ({e})"))
+                AgentError::ClientBuildError(format!(
+                    "Failed to parse min_price_per_mcycle: {v} ({e})"
+                ))
             })? * U256::from(mcycles_count),
         ),
     };
@@ -2702,11 +2721,7 @@ mod tests {
         #[derive(Debug)]
         struct MockEval;
         impl super::GuestEvaluator for MockEval {
-            fn evaluate(
-                &self,
-                _guest_env: GuestEnv,
-                _elf: &[u8],
-            ) -> AgentResult<(u64, Vec<u8>)> {
+            fn evaluate(&self, _guest_env: GuestEnv, _elf: &[u8]) -> AgentResult<(u64, Vec<u8>)> {
                 Ok((1, vec![7u8, 7u8, 7u8]))
             }
         }
@@ -2756,8 +2771,8 @@ mod tests {
             if let Some(req) = prover.get_request_status(&request_id).await {
                 match req.status {
                     ProofRequestStatus::Fulfilled { proof, .. } => {
-                        let response: Risc0Response =
-                            bincode::deserialize(&proof).expect("proof should be bincode Risc0Response");
+                        let response: Risc0Response = bincode::deserialize(&proof)
+                            .expect("proof should be bincode Risc0Response");
                         assert!(response.seal.is_empty());
                         assert!(response.receipt.is_none());
                         assert_eq!(response.journal, vec![7u8, 7u8, 7u8]);
@@ -3118,8 +3133,9 @@ mod tests {
     #[test]
     fn test_offer_params_max_price() {
         let offer_params = test_batch_offer_params();
-        let max_price_per_mcycle = parse_ether(offer_params.max_price_per_mcycle.as_deref().unwrap())
-            .expect("Failed to parse max_price_per_mcycle");
+        let max_price_per_mcycle =
+            parse_ether(offer_params.max_price_per_mcycle.as_deref().unwrap())
+                .expect("Failed to parse max_price_per_mcycle");
         let max_price = max_price_per_mcycle * U256::from(1000u64);
         // 0.00003 * 1000 = 0.03 ETH
         assert_eq!(max_price, U256::from(30000000000000000u128));
@@ -3132,7 +3148,7 @@ mod tests {
 
         let lock_collateral_per_mcycle =
             parse_staking_token(offer_params.lock_collateral.as_deref().unwrap())
-            .expect("Failed to parse lock_collateral_per_mcycle");
+                .expect("Failed to parse lock_collateral_per_mcycle");
         let lock_collateral = lock_collateral_per_mcycle * U256::from(1000u64);
         // 0.0001 * 1000 = 0.1 USDC
         assert_eq!(lock_collateral, U256::from(100000000000000000u64));

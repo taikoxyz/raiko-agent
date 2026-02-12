@@ -207,7 +207,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = match fixture.proof.output_path.as_ref() {
         Some(p) => read_output_bytes(
             Path::new(p),
-            fixture.proof.output_encoding.unwrap_or(OutputEncoding::Auto),
+            fixture
+                .proof
+                .output_encoding
+                .unwrap_or(OutputEncoding::Auto),
         )
         .map_err(|e| format!("failed to read/encode output_path {p}: {e}"))?,
         None => Vec::new(),
