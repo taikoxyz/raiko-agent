@@ -792,9 +792,19 @@ impl BoundlessProver {
             )));
         }
 
+        // Use same encoding as normal Boundless flow so /status proof payload is consistent.
+        let response = Risc0Response {
+            seal: Vec::new(),
+            journal: journal.clone(),
+            receipt: None,
+        };
+        let proof_bytes = bincode::serialize(&response).map_err(|e| {
+            AgentError::ResponseEncodeError(format!("Failed to encode evaluation_only response: {e}"))
+        })?;
+
         let status = ProofRequestStatus::Fulfilled {
             provider_request_id: format!("local_eval:{}", request_id),
-            proof: journal,
+            proof: proof_bytes,
         };
         self.update_request_status(request_id, status, &active_requests)
             .await?;
@@ -2746,7 +2756,11 @@ mod tests {
             if let Some(req) = prover.get_request_status(&request_id).await {
                 match req.status {
                     ProofRequestStatus::Fulfilled { proof, .. } => {
-                        assert_eq!(proof, vec![7u8, 7u8, 7u8]);
+                        let response: Risc0Response =
+                            bincode::deserialize(&proof).expect("proof should be bincode Risc0Response");
+                        assert!(response.seal.is_empty());
+                        assert!(response.receipt.is_none());
+                        assert_eq!(response.journal, vec![7u8, 7u8, 7u8]);
                         break;
                     }
                     ProofRequestStatus::Failed { error } => panic!("unexpected failed: {error}"),
