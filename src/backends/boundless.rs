@@ -42,8 +42,12 @@ struct Risc0GuestEvaluator;
 
 impl GuestEvaluator for Risc0GuestEvaluator {
     fn evaluate(&self, guest_env: GuestEnv, elf: &[u8]) -> AgentResult<(u64, Vec<u8>)> {
+        let converted_guest_env = guest_env
+            .try_into()
+            .map_err(|e| AgentError::GuestExecutionError(format!("Failed to convert guest env: {e}")))?;
+
         let session_info = default_executor()
-            .execute(guest_env.try_into().unwrap(), elf)
+            .execute(converted_guest_env, elf)
             .map_err(|e| AgentError::GuestExecutionError(format!("Failed to execute guest: {e}")))?;
 
         let mcycles_count = session_info
