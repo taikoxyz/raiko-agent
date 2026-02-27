@@ -2602,7 +2602,7 @@ fn validate_offer_params(
             ));
         }
         (_, None) => None,
-        (_, Some(v)) => Some(parse_staking_token(v)? * U256::from(mcycles_count)),
+        (_, Some(v)) => Some(parse_staking_token(v)?),
     };
     let lock_timeout = offer_spec.lock_timeout_ms_per_mcycle * mcycles_count / 1000u32;
     let timeout = offer_spec.timeout_ms_per_mcycle * mcycles_count / 1000u32;
