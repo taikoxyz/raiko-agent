@@ -880,6 +880,27 @@ impl BoundlessProver {
         })
     }
 
+    async fn get_or_refresh_image(&self, elf_type: ElfType) -> AgentResult<ImageInfo> {
+        let image_info = self
+            .image_manager
+            .get_image(ProverType::Boundless, elf_type.clone())
+            .await
+            .ok_or_else(|| {
+                AgentError::ProgramUploadError(format!(
+                    "{} image not uploaded. Please upload via /upload-image endpoint first.",
+                    match elf_type {
+                        ElfType::Batch => "Batch",
+                        ElfType::Aggregation => "Aggregation",
+                    }
+                ))
+            })?;
+
+        Ok(self
+            .upload_image(elf_type, image_info.elf_bytes.clone())
+            .await?
+            .info)
+    }
+
     async fn upload_with_refresh_meta(
         &self,
         elf_type: &ElfType,
@@ -1846,19 +1867,12 @@ impl BoundlessProver {
         tokio::spawn(async move {
             let offer_params = prover_clone.boundless_config.get_batch_offer_params();
 
-            // Get image info from ImageManager
-            let image_info = match prover_clone
-                .image_manager
-                .get_image(ProverType::Boundless, ElfType::Batch)
-                .await
-            {
-                Some(info) => info,
-                None => {
-                    let err_msg =
-                        "Batch image not uploaded. Please upload via /upload-image endpoint first.";
-                    tracing::error!("{}", err_msg);
+            let image_info = match prover_clone.get_or_refresh_image(ElfType::Batch).await {
+                Ok(info) => info,
+                Err(e) => {
+                    tracing::error!("{}", e);
                     prover_clone
-                        .update_failed_status(&request_id_clone, err_msg.to_string())
+                        .update_failed_status(&request_id_clone, e.to_string())
                         .await;
                     return;
                 }
@@ -1979,18 +1993,15 @@ impl BoundlessProver {
         tokio::spawn(async move {
             let offer_params = prover_clone.boundless_config.get_aggregation_offer_params();
 
-            // Get image info from ImageManager
             let image_info = match prover_clone
-                .image_manager
-                .get_image(ProverType::Boundless, ElfType::Aggregation)
+                .get_or_refresh_image(ElfType::Aggregation)
                 .await
             {
-                Some(info) => info,
-                None => {
-                    let err_msg = "Aggregation image not uploaded. Please upload via /upload-image endpoint first.";
-                    tracing::error!("{}", err_msg);
+                Ok(info) => info,
+                Err(e) => {
+                    tracing::error!("{}", e);
                     prover_clone
-                        .update_failed_status(&request_id_clone, err_msg.to_string())
+                        .update_failed_status(&request_id_clone, e.to_string())
                         .await;
                     return;
                 }
