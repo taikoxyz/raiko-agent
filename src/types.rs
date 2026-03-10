@@ -4,6 +4,44 @@ use std::fmt;
 use std::str::FromStr;
 use utoipa::ToSchema;
 
+pub const RAIKO2_INPUT_ENCODING_KEY: &str = "raiko2_input_encoding";
+pub const RAIKO2_RISC0_SHASTA_BATCH_V1: &str = "risc0_shasta_batch_v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Raiko2InputEncodingConfig {
+    pub kind: String,
+    pub proof_carry_data: String,
+}
+
+pub fn decode_raiko2_batch_proof_carry_data(
+    config: &serde_json::Value,
+) -> AgentResult<Option<Vec<u8>>> {
+    let Some(value) = config.get(RAIKO2_INPUT_ENCODING_KEY) else {
+        return Ok(None);
+    };
+
+    let encoding: Raiko2InputEncodingConfig =
+        serde_json::from_value(value.clone()).map_err(|e| {
+            AgentError::RequestBuildError(format!(
+                "Failed to parse raiko2 input encoding config: {e}"
+            ))
+        })?;
+
+    if encoding.kind != RAIKO2_RISC0_SHASTA_BATCH_V1 {
+        return Err(AgentError::RequestBuildError(format!(
+            "Unsupported raiko2 input encoding kind: {}",
+            encoding.kind
+        )));
+    }
+
+    let proof_carry_data = hex::decode(encoding.proof_carry_data.trim_start_matches("0x"))
+        .map_err(|e| {
+            AgentError::RequestBuildError(format!("Failed to decode ProofCarryData from hex: {e}"))
+        })?;
+
+    Ok(Some(proof_carry_data))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProverType {
