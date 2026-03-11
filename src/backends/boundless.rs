@@ -6,7 +6,6 @@ use crate::image_manager::{ImageInfo, ImageManager, ImageUploadResult};
 use crate::storage::RequestStorage;
 use crate::types::{
     AgentError, AgentResult, AsyncProofRequest, ElfType, ProofRequestStatus, ProofType, ProverType,
-    decode_raiko2_batch_proof_carry_data,
 };
 use alloy_primitives_v1p2p0::{
     B256, U256,
@@ -666,19 +665,8 @@ impl BoundlessProver {
     }
 
     /// Process input and create guest environment
-    fn process_input(
-        &self,
-        input: Vec<u8>,
-        proof_type: &ProofType,
-        config: &serde_json::Value,
-    ) -> AgentResult<(GuestEnv, Vec<u8>)> {
-        let mut builder = GuestEnv::builder().write_frame(&input);
-        if matches!(proof_type, ProofType::Batch)
-            && let Some(proof_carry_data) = decode_raiko2_batch_proof_carry_data(config)?
-        {
-            builder = builder.write_frame(&proof_carry_data);
-        }
-        let guest_env = builder.build_env();
+    fn process_input(&self, input: Vec<u8>) -> AgentResult<(GuestEnv, Vec<u8>)> {
+        let guest_env = GuestEnv::builder().write_frame(&input).build_env();
         let guest_env_bytes = guest_env.clone().encode().map_err(|e| {
             AgentError::ClientBuildError(format!("Failed to encode guest environment: {e}"))
         })?;
@@ -1233,14 +1221,12 @@ impl BoundlessProver {
                     let request_id = request.request_id.clone();
                     let input = request.input.clone();
                     let output = request.output.clone();
-                    let config = request.config.clone();
                     tokio::spawn(async move {
                         if let Err(e) = prover_clone
                             .process_and_submit_request(
                                 &request_id,
                                 input,
                                 output,
-                                &config,
                                 &image_info.elf_bytes,
                                 image_url,
                                 offer_params,
@@ -1323,14 +1309,12 @@ impl BoundlessProver {
 
             let active_requests = self.active_requests.clone();
             let prover_clone = self.clone();
-            let config = request.config.clone();
             tokio::spawn(async move {
                 if let Err(e) = prover_clone
                     .process_and_submit_request(
                         &request.request_id,
                         request.input,
                         request.output,
-                        &config,
                         &image_info.elf_bytes,
                         image_url,
                         offer_params,
@@ -1632,7 +1616,6 @@ impl BoundlessProver {
         request_id: &str,
         input: Vec<u8>,
         output: Vec<u8>,
-        config: &serde_json::Value,
         elf: &[u8],
         image_url: Url,
         offer_params: BoundlessOfferParams,
@@ -1662,11 +1645,9 @@ impl BoundlessProver {
         })?;
 
         // Process input and create guest environment
-        let (guest_env, guest_env_bytes) =
-            self.process_input(input, &proof_type, config)
-                .map_err(|e| {
-                    AgentError::GuestEnvEncodeError(format!("Failed to process input: {}", e))
-                })?;
+        let (guest_env, guest_env_bytes) = self.process_input(input).map_err(|e| {
+            AgentError::GuestEnvEncodeError(format!("Failed to process input: {}", e))
+        })?;
 
         // Evaluate cost
         // let (mcycles_count, _) = self.evaluate_cost(&guest_env, elf).await
@@ -1882,8 +1863,6 @@ impl BoundlessProver {
         let prover_clone = self.clone();
         let active_requests = self.active_requests.clone();
         let request_id_clone = request_id.clone();
-        let config = config.clone();
-
         tokio::spawn(async move {
             let offer_params = prover_clone.boundless_config.get_batch_offer_params();
 
@@ -1912,7 +1891,6 @@ impl BoundlessProver {
                     &request_id_clone,
                     input,
                     output,
-                    &config,
                     &image_info.elf_bytes,
                     image_url,
                     offer_params,
@@ -2010,8 +1988,6 @@ impl BoundlessProver {
         let prover_clone = self.clone();
         let active_requests = self.active_requests.clone();
         let request_id_clone = request_id.clone();
-        let config = config.clone();
-
         tokio::spawn(async move {
             let offer_params = prover_clone.boundless_config.get_aggregation_offer_params();
 
@@ -2043,7 +2019,6 @@ impl BoundlessProver {
                     &request_id_clone,
                     input,
                     output,
-                    &config,
                     &image_info.elf_bytes,
                     image_url,
                     offer_params,
@@ -2381,7 +2356,6 @@ mod tests {
 
     use super::*;
     use crate::storage::RequestStorage;
-    use crate::types::RAIKO2_INPUT_ENCODING_KEY;
     use alloy_primitives_v1p2p0::hex;
     use env_logger;
     use ethers_contract::abigen;
@@ -2446,14 +2420,6 @@ mod tests {
             signer_key: "0x0000000000000000000000000000000000000000000000000000000000000001"
                 .to_string(),
         }
-    }
-
-    async fn test_prover() -> BoundlessProver {
-        let image_manager = ImageManager::new();
-        let storage = RequestStorage::new(":memory:".to_string());
-        BoundlessProver::new(test_prover_config(), image_manager, storage)
-            .await
-            .expect("test prover should initialize")
     }
 
     #[tokio::test]
@@ -2882,49 +2848,5 @@ mod tests {
             offer_params.max_price_per_mcycle,
             config.offer_params.aggregation.max_price_per_mcycle
         );
-    }
-
-    #[tokio::test]
-    async fn process_input_uses_legacy_single_frame_without_config() {
-        let prover = test_prover().await;
-        let input = vec![1_u8, 2, 3, 4];
-
-        let (_, encoded) = prover
-            .process_input(input.clone(), &ProofType::Batch, &serde_json::Value::Null)
-            .expect("legacy process_input should succeed");
-
-        let expected = GuestEnv::builder()
-            .write_frame(&input)
-            .build_env()
-            .encode()
-            .expect("expected encoding");
-
-        assert_eq!(encoded, expected);
-    }
-
-    #[tokio::test]
-    async fn process_input_appends_proof_carry_data_frame_for_raiko2_batch_requests() {
-        let prover = test_prover().await;
-        let input = vec![1_u8, 2, 3, 4];
-        let proof_carry_data = vec![9_u8, 8, 7, 6];
-        let config = serde_json::json!({
-            RAIKO2_INPUT_ENCODING_KEY: {
-                "kind": "risc0_shasta_batch_v1",
-                "proof_carry_data": format!("0x{}", hex::encode(&proof_carry_data)),
-            }
-        });
-
-        let (_, encoded) = prover
-            .process_input(input.clone(), &ProofType::Batch, &config)
-            .expect("raiko2 batch process_input should succeed");
-
-        let expected = GuestEnv::builder()
-            .write_frame(&input)
-            .write_frame(&proof_carry_data)
-            .build_env()
-            .encode()
-            .expect("expected encoding");
-
-        assert_eq!(encoded, expected);
     }
 }
