@@ -20,7 +20,7 @@ use boundless_market::{
     request_builder::OfferParams,
 };
 use risc0_ethereum_contracts_boundless::receipt::{Receipt as ContractReceipt, decode_seal};
-use risc0_zkvm::{Digest, Journal, Receipt as ZkvmReceipt, compute_image_id, default_executor};
+use risc0_zkvm::{Digest, Journal, Receipt as ZkvmReceipt, compute_image_id, local_executor};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -103,6 +103,17 @@ fn parse_tx_hash(tx_hash: &str) -> Option<B256> {
     let mut bytes = [0u8; 32];
     alloy_primitives_v1p2p0::hex::decode_to_slice(trimmed, &mut bytes).ok()?;
     Some(B256::from(bytes))
+}
+
+fn select_request_journal(
+    proof_type: &ProofType,
+    provided_output: Vec<u8>,
+    evaluated_journal: Option<Vec<u8>>,
+) -> Vec<u8> {
+    match proof_type {
+        ProofType::Batch => evaluated_journal.unwrap_or(provided_output),
+        ProofType::Aggregate | ProofType::Update(_) => provided_output,
+    }
 }
 
 /// Generic retry function with exponential backoff
@@ -880,6 +891,27 @@ impl BoundlessProver {
         })
     }
 
+    async fn get_or_refresh_image(&self, elf_type: ElfType) -> AgentResult<ImageInfo> {
+        let image_info = self
+            .image_manager
+            .get_image(ProverType::Boundless, elf_type.clone())
+            .await
+            .ok_or_else(|| {
+                AgentError::ProgramUploadError(format!(
+                    "{} image not uploaded. Please upload via /upload-image endpoint first.",
+                    match elf_type {
+                        ElfType::Batch => "Batch",
+                        ElfType::Aggregation => "Aggregation",
+                    }
+                ))
+            })?;
+
+        Ok(self
+            .upload_image(elf_type, image_info.elf_bytes.clone())
+            .await?
+            .info)
+    }
+
     async fn upload_with_refresh_meta(
         &self,
         elf_type: &ElfType,
@@ -1635,6 +1667,20 @@ impl BoundlessProver {
             ProofType::Aggregate => 200,
             ProofType::Batch | ProofType::Update(_) => 6000,
         };
+        let evaluated_journal = match proof_type {
+            ProofType::Batch => {
+                let (_mcycles_count, journal) = self._evaluate_cost(&guest_env, elf).await?;
+                if !output.is_empty() && output != journal {
+                    tracing::warn!(
+                        "Ignoring provided batch output for {} because it does not match the evaluated journal",
+                        request_id
+                    );
+                }
+                Some(journal)
+            }
+            ProofType::Aggregate | ProofType::Update(_) => None,
+        };
+        let request_journal = select_request_journal(&proof_type, output, evaluated_journal);
 
         // Upload input to storage so provers fetch from a URL (preferred over inline)
         tracing::info!(
@@ -1658,7 +1704,7 @@ impl BoundlessProver {
                 guest_env,
                 &offer_params,
                 mcycles_count as u32,
-                output,
+                request_journal,
             )
             .await
             .map_err(|e| {
@@ -1842,23 +1888,15 @@ impl BoundlessProver {
         let prover_clone = self.clone();
         let active_requests = self.active_requests.clone();
         let request_id_clone = request_id.clone();
-
         tokio::spawn(async move {
             let offer_params = prover_clone.boundless_config.get_batch_offer_params();
 
-            // Get image info from ImageManager
-            let image_info = match prover_clone
-                .image_manager
-                .get_image(ProverType::Boundless, ElfType::Batch)
-                .await
-            {
-                Some(info) => info,
-                None => {
-                    let err_msg =
-                        "Batch image not uploaded. Please upload via /upload-image endpoint first.";
-                    tracing::error!("{}", err_msg);
+            let image_info = match prover_clone.get_or_refresh_image(ElfType::Batch).await {
+                Ok(info) => info,
+                Err(e) => {
+                    tracing::error!("{}", e);
                     prover_clone
-                        .update_failed_status(&request_id_clone, err_msg.to_string())
+                        .update_failed_status(&request_id_clone, e.to_string())
                         .await;
                     return;
                 }
@@ -1975,22 +2013,18 @@ impl BoundlessProver {
         let prover_clone = self.clone();
         let active_requests = self.active_requests.clone();
         let request_id_clone = request_id.clone();
-
         tokio::spawn(async move {
             let offer_params = prover_clone.boundless_config.get_aggregation_offer_params();
 
-            // Get image info from ImageManager
             let image_info = match prover_clone
-                .image_manager
-                .get_image(ProverType::Boundless, ElfType::Aggregation)
+                .get_or_refresh_image(ElfType::Aggregation)
                 .await
             {
-                Some(info) => info,
-                None => {
-                    let err_msg = "Aggregation image not uploaded. Please upload via /upload-image endpoint first.";
-                    tracing::error!("{}", err_msg);
+                Ok(info) => info,
+                Err(e) => {
+                    tracing::error!("{}", e);
                     prover_clone
-                        .update_failed_status(&request_id_clone, err_msg.to_string())
+                        .update_failed_status(&request_id_clone, e.to_string())
                         .await;
                     return;
                 }
@@ -2179,7 +2213,7 @@ impl BoundlessProver {
             // It can also be useful to ensure the guest can be executed correctly and we do not send into
             // the market unprovable proving requests. If you have a different mechanism to get the expected
             // journal and set a price, you can skip this step.
-            let session_info = default_executor()
+            let session_info = local_executor()
                 .execute(guest_env.clone().try_into().unwrap(), elf)
                 .map_err(|e| {
                     AgentError::GuestExecutionError(format!(
@@ -2468,6 +2502,34 @@ mod tests {
         // Test invalid deployment types
         assert!(DeploymentType::from_str("invalid").is_err());
         assert!(DeploymentType::from_str("").is_err());
+    }
+
+    #[test]
+    fn test_select_request_journal_prefers_evaluated_batch_journal() {
+        let provided_output = vec![1, 2, 3];
+        let evaluated_journal = vec![4, 5, 6];
+
+        let selected = select_request_journal(
+            &ProofType::Batch,
+            provided_output,
+            Some(evaluated_journal.clone()),
+        );
+
+        assert_eq!(selected, evaluated_journal);
+    }
+
+    #[test]
+    fn test_select_request_journal_keeps_aggregation_output() {
+        let provided_output = vec![7, 8, 9];
+        let evaluated_journal = vec![10, 11, 12];
+
+        let selected = select_request_journal(
+            &ProofType::Aggregate,
+            provided_output.clone(),
+            Some(evaluated_journal),
+        );
+
+        assert_eq!(selected, provided_output);
     }
 
     #[ignore = "requires storage provider (IPFS/Pinata)"]
